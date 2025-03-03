@@ -1,0 +1,657 @@
+// Circuit IQ - Frontend Integration with DatasheetExtractor
+// Simple JavaScript implementation for handling datasheet uploads and processing
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Initialize datasheet handling
+    setupDatasheetHandling();
+    
+    // Set up the PCB design form
+    document.getElementById('pcbDesignForm').addEventListener('submit', handleFormSubmit);
+});
+
+/**
+ * Setup datasheet handling functionality
+ */
+function setupDatasheetHandling() {
+    // Initial setup for existing datasheet containers
+    setupFileDropAreas();
+    
+    // Add event listener for adding new datasheets
+    document.getElementById('addDatasheet').addEventListener('click', function() {
+        const datasheetList = document.getElementById('datasheetList');
+        const newDatasheet = createDatasheetContainer();
+        datasheetList.appendChild(newDatasheet);
+        
+        // Setup the new drop area
+        setupFileDropArea(
+            newDatasheet.querySelector('.file-drop-area'),
+            newDatasheet.querySelector('.datasheet-file')
+        );
+        
+        // Add remove functionality
+        newDatasheet.querySelector('.remove-datasheet').addEventListener('click', function() {
+            datasheetList.removeChild(newDatasheet);
+        });
+    });
+}
+
+/**
+ * Create a new datasheet container element
+ * @returns {HTMLElement} The created container
+ */
+function createDatasheetContainer() {
+    const container = document.createElement('div');
+    container.className = 'datasheet-container';
+    container.innerHTML = `
+        <div class="d-flex justify-content-between mb-3">
+            <input type="text" class="form-control component-name" placeholder="Component Name (e.g., ATmega328P, LM7805)">
+            <button type="button" class="btn btn-outline-secondary ms-2 remove-datasheet">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="file-drop-area">
+            <i class="fas fa-file-pdf mb-2"></i>
+            <p class="mb-1">Drag & drop component datasheet (PDF)</p>
+            <small class="text-muted">or click to browse files</small>
+            <input type="file" class="datasheet-file form-control d-none" accept=".pdf">
+        </div>
+        <div class="extracted-data mt-3" style="display: none;">
+            <h6>Extracted Component Information</h6>
+            <div class="extracted-parameters"></div>
+        </div>
+    `;
+    return container;
+}
+
+/**
+ * Setup all file drop areas in the document
+ */
+function setupFileDropAreas() {
+    document.querySelectorAll('.file-drop-area').forEach(dropArea => {
+        const fileInput = dropArea.querySelector('.datasheet-file');
+        setupFileDropArea(dropArea, fileInput);
+    });
+}
+
+/**
+ * Setup a single file drop area
+ * @param {HTMLElement} dropArea - The drop area element
+ * @param {HTMLElement} fileInput - The file input element
+ */
+function setupFileDropArea(dropArea, fileInput) {
+    // Click to browse files
+    dropArea.addEventListener('click', () => {
+        fileInput.click();
+    });
+    
+    // File input change handler
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            handleFile(e.target.files[0], dropArea, fileInput);
+        }
+    });
+    
+    // Drag and drop handlers
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, preventDefaults, false);
+    });
+    
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => {
+            dropArea.style.borderColor = '#2563eb';
+            dropArea.style.backgroundColor = '#dbeafe';
+        }, false);
+    });
+    
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => {
+            dropArea.style.borderColor = '#e2e8f0';
+            dropArea.style.backgroundColor = '#f8fafc';
+        }, false);
+    });
+    
+    // Handle file drop
+    dropArea.addEventListener('drop', (e) => {
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        if (files.length > 0) {
+            handleFile(files[0], dropArea, fileInput);
+        }
+    }, false);
+}
+
+/**
+ * Prevent default browser behavior for events
+ * @param {Event} e - The event object
+ */
+function preventDefaults(e) {
+    e.preventDefault();
+    e.stopPropagation();
+}
+
+/**
+ * Handle an uploaded datasheet file
+ * @param {File} file - The uploaded file
+ * @param {HTMLElement} dropArea - The drop area element
+ * @param {HTMLElement} fileInput - The file input element
+ */
+function handleFile(file, dropArea, fileInput) {
+    const container = dropArea.closest('.datasheet-container');
+    const componentNameInput = container.querySelector('.component-name');
+    const extractedDataSection = container.querySelector('.extracted-data');
+    const extractedParametersDiv = container.querySelector('.extracted-parameters');
+    
+    // Update drop area to show file name
+    dropArea.innerHTML = `
+        <i class="fas fa-file-pdf mb-2"></i>
+        <p class="mb-1">${file.name}</p>
+        <small class="text-muted">Click to change</small>
+        <input type="file" class="datasheet-file form-control d-none" accept=".pdf">
+    `;
+    
+    // Re-attach click handler to the file input
+    const newFileInput = dropArea.querySelector('.datasheet-file');
+    newFileInput.addEventListener('change', function(e) {
+        if (e.target.files.length > 0) {
+            handleFile(e.target.files[0], dropArea, newFileInput);
+        }
+    });
+    
+    // Extract file name as potential component name if not already filled
+    if (!componentNameInput.value) {
+        const nameWithoutExtension = file.name.replace(/\.[^/.]+$/, "");
+        const cleanedName = nameWithoutExtension.replace(/_/g, ' ');
+        componentNameInput.value = cleanedName;
+    }
+    
+    // In a real application, we would send the file to the server for processing
+    // For this MVP, we'll simulate the extraction with mock data
+    extractParametersFromFile(file)
+        .then(data => {
+            // Show the extracted data
+            extractedDataSection.style.display = 'block';
+            displayExtractedParameters(data, extractedParametersDiv);
+        })
+        .catch(error => {
+            // Show error
+            extractedDataSection.style.display = 'block';
+            extractedParametersDiv.innerHTML = `
+                <div class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    ${error.message}
+                </div>
+            `;
+        });
+}
+
+/**
+ * Extract parameters from a datasheet file (mock implementation)
+ * @param {File} file - The datasheet file
+ * @returns {Promise<Object>} The extracted parameters
+ */
+function extractParametersFromFile(file) {
+    return new Promise((resolve, reject) => {
+        // Simulate server processing delay
+        setTimeout(() => {
+            // For MVP, we'll just provide mock data based on the filename
+            const filename = file.name.toLowerCase();
+            
+            if (filename.includes('error') || filename.includes('fail')) {
+                reject(new Error('Failed to extract data from datasheet'));
+                return;
+            }
+            
+            // Generate mock data based on filename hints
+            let mockData = {
+                parameters: {
+                    part_number: 'Unknown',
+                    type: 'Unknown',
+                    package: 'Unknown',
+                    pins: 0,
+                    voltage: 'Unknown',
+                    current: 'Unknown'
+                },
+                connections: {
+                    all_pins: []
+                }
+            };
+            
+            // Parse component type from filename
+            if (filename.includes('7805') || filename.includes('regulator')) {
+                mockData.parameters = {
+                    part_number: 'LM7805',
+                    type: 'Voltage Regulator',
+                    package: 'TO-220',
+                    pins: 3,
+                    voltage: '5V output, 7-35V input',
+                    current: '1.5A'
+                };
+                mockData.connections.all_pins = [
+                    { number: 1, description: 'Input', category: 'power' },
+                    { number: 2, description: 'GND', category: 'ground' },
+                    { number: 3, description: 'Output', category: 'power' }
+                ];
+            } else if (filename.includes('328') || filename.includes('arduino') || filename.includes('micro')) {
+                mockData.parameters = {
+                    part_number: 'ATmega328P',
+                    type: 'Microcontroller',
+                    package: 'DIP/TQFP',
+                    pins: 28,
+                    voltage: '1.8-5.5V',
+                    current: '200mA max'
+                };
+                // Only include first few pins for brevity
+                mockData.connections.all_pins = [
+                    { number: 1, description: 'Reset', category: 'other' },
+                    { number: 2, description: 'RX', category: 'io' },
+                    { number: 3, description: 'TX', category: 'io' },
+                    { number: 7, description: 'VCC', category: 'power' },
+                    { number: 8, description: 'GND', category: 'ground' }
+                ];
+            } else if (filename.includes('555') || filename.includes('timer')) {
+                mockData.parameters = {
+                    part_number: 'NE555',
+                    type: 'Timer IC',
+                    package: 'DIP-8',
+                    pins: 8,
+                    voltage: '4.5-16V',
+                    current: '15mA'
+                };
+                mockData.connections.all_pins = [
+                    { number: 1, description: 'GND', category: 'ground' },
+                    { number: 2, description: 'Trigger', category: 'io' },
+                    { number: 3, description: 'Output', category: 'io' },
+                    { number: 4, description: 'Reset', category: 'io' },
+                    { number: 8, description: 'VCC', category: 'power' }
+                ];
+            }
+            
+            resolve(mockData);
+        }, 1000); // Simulate 1 second delay
+    });
+}
+
+/**
+ * Display extracted parameters in the UI
+ * @param {Object} data - The extracted data
+ * @param {HTMLElement} container - The container element to display in
+ */
+function displayExtractedParameters(data, container) {
+    if (!data || !data.parameters) {
+        container.innerHTML = '<div class="alert alert-warning">No data could be extracted</div>';
+        return;
+    }
+    
+    const params = data.parameters;
+    let html = '<div class="card p-3 bg-light">';
+    
+    // Add parameters
+    for (const [key, value] of Object.entries(params)) {
+        if (value && value !== 'Unknown') {
+            html += `<div><strong>${key.replace('_', ' ')}:</strong> ${value}</div>`;
+        }
+    }
+    
+    // Add pins if available
+    if (data.connections && data.connections.all_pins && data.connections.all_pins.length > 0) {
+        html += '<div class="mt-2"><strong>Pins:</strong>';
+        html += '<div class="small">';
+        
+        // Only show first 5 pins if there are many
+        const pinsToShow = data.connections.all_pins.slice(0, 5);
+        pinsToShow.forEach(pin => {
+            html += `<div>Pin ${pin.number}: ${pin.description}</div>`;
+        });
+        
+        if (data.connections.all_pins.length > 5) {
+            html += `<div>...and ${data.connections.all_pins.length - 5} more pins</div>`;
+        }
+        
+        html += '</div></div>';
+    }
+    
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+/**
+ * Handle form submission (generate PCB design)
+ * @param {Event} e - The form submit event
+ */
+function handleFormSubmit(e) {
+    e.preventDefault();
+    
+    // Hide empty state and any previous errors
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('errorContainer').style.display = 'none';
+    document.getElementById('outputContainer').style.display = 'none';
+    
+    // Show loading indicator
+    document.getElementById('loadingIndicator').style.display = 'block';
+    
+    // Collect form data
+    const projectName = document.getElementById('projectName').value || 'Untitled PCB';
+    const requirements = document.getElementById('requirements').value;
+    const boardWidth = document.getElementById('boardWidth').value;
+    const boardHeight = document.getElementById('boardHeight').value;
+    const boardLayers = document.getElementById('boardLayers').value;
+    
+    // Validate requirements
+    if (!requirements) {
+        showError('Please describe your circuit requirements');
+        return;
+    }
+    
+    // Collect datasheet information
+    const components = [];
+    document.querySelectorAll('.datasheet-container').forEach(container => {
+        const name = container.querySelector('.component-name').value.trim();
+        const fileInput = container.querySelector('.datasheet-file');
+        
+        if (name) {
+            components.push({
+                name: name,
+                has_datasheet: fileInput.files.length > 0,
+                file_name: fileInput.files.length > 0 ? fileInput.files[0].name : null
+            });
+        }
+    });
+    
+    // Prepare request data
+    const requestData = {
+        project_name: projectName,
+        requirements: requirements,
+        board_params: {
+            width: parseFloat(boardWidth),
+            height: parseFloat(boardHeight),
+            layers: parseInt(boardLayers)
+        },
+        components: components
+    };
+    
+    // Simulate design generation
+    simulateDesignProcess(requestData);
+}
+
+/**
+ * Show an error message
+ * @param {string} message - The error message
+ */
+function showError(message) {
+    document.getElementById('loadingIndicator').style.display = 'none';
+    document.getElementById('emptyState').style.display = 'block';
+    
+    const errorContainer = document.getElementById('errorContainer');
+    errorContainer.style.display = 'block';
+    errorContainer.innerHTML = `<i class="fas fa-exclamation-circle me-2"></i> ${message}`;
+}
+
+/**
+ * Simulate the PCB design generation process
+ * @param {Object} requestData - The request data
+ */
+function simulateDesignProcess(requestData) {
+    const progressBar = document.getElementById('designProgress');
+    const stageText = document.getElementById('designStage');
+    
+    // Reset progress bar
+    progressBar.style.width = '0%';
+    
+    // Define design stages
+    const stages = [
+        { progress: 15, text: 'Analyzing requirements...', time: 600 },
+        { progress: 30, text: 'Processing components...', time: 800 },
+        { progress: 50, text: 'Generating circuit schematic...', time: 1000 },
+        { progress: 70, text: 'Routing traces...', time: 1200 },
+        { progress: 90, text: 'Generating Gerber files...', time: 600 },
+        { progress: 100, text: 'Design complete!', time: 400 }
+    ];
+    
+    // Simulate progress through stages
+    let currentStage = 0;
+    
+    function processNextStage() {
+        if (currentStage >= stages.length) {
+            // Design is complete
+            setTimeout(() => {
+                document.getElementById('loadingIndicator').style.display = 'none';
+                showGeneratedDesign(requestData);
+            }, 500);
+            return;
+        }
+        
+        const stage = stages[currentStage];
+        progressBar.style.width = stage.progress + '%';
+        stageText.textContent = stage.text;
+        
+        setTimeout(() => {
+            currentStage++;
+            processNextStage();
+        }, stage.time);
+    }
+    
+    // Start the process
+    processNextStage();
+}
+
+/**
+ * Display the generated PCB design
+ * @param {Object} requestData - The request data
+ */
+function showGeneratedDesign(requestData) {
+    const outputContainer = document.getElementById('outputContainer');
+    outputContainer.style.display = 'block';
+    
+    // Display PCB preview image
+    const pcbPreview = document.getElementById('pcbPreview');
+    pcbPreview.src = generatePreviewImageUrl(requestData, 'front');
+    
+    // Set up view buttons
+    document.getElementById('viewFront').classList.add('active');
+    document.getElementById('viewBack').classList.remove('active');
+    
+    document.getElementById('viewFront').addEventListener('click', function() {
+        pcbPreview.src = generatePreviewImageUrl(requestData, 'front');
+        this.classList.add('active');
+        document.getElementById('viewBack').classList.remove('active');
+    });
+    
+    document.getElementById('viewBack').addEventListener('click', function() {
+        pcbPreview.src = generatePreviewImageUrl(requestData, 'back');
+        this.classList.add('active');
+        document.getElementById('viewFront').classList.remove('active');
+    });
+    
+    // Generate Gerber files based on layers
+    const gerberFiles = [
+        { name: 'F_Cu.gbr', desc: 'Top Copper Layer' },
+        { name: 'F_Mask.gbr', desc: 'Top Solder Mask' },
+        { name: 'F_SilkS.gbr', desc: 'Top Silkscreen' },
+        { name: 'Edge_Cuts.gbr', desc: 'Board Outline' },
+        { name: 'board.drl', desc: 'Drill File' }
+    ];
+    
+    if (requestData.board_params.layers > 1) {
+        gerberFiles.push(
+            { name: 'B_Cu.gbr', desc: 'Bottom Copper Layer' },
+            { name: 'B_Mask.gbr', desc: 'Bottom Solder Mask' },
+            { name: 'B_SilkS.gbr', desc: 'Bottom Silkscreen' }
+        );
+    }
+    
+    // Populate Gerber files table
+    const gerberList = document.getElementById('gerberFilesList');
+    gerberList.innerHTML = '';
+    
+    gerberFiles.forEach(file => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${file.name}</td>
+            <td>${file.desc}</td>
+            <td>
+                <button type="button" class="btn btn-sm btn-outline-secondary download-file" data-file="${file.name}">
+                    <i class="fas fa-download"></i>
+                </button>
+            </td>
+        `;
+        gerberList.appendChild(row);
+        
+        // Add download event listener
+        row.querySelector('.download-file').addEventListener('click', function() {
+            alert(`Downloading ${file.name} (In a production app, this would download the actual file)`);
+        });
+    });
+    
+    // Add event listener for download all button
+    document.getElementById('downloadAllBtn').addEventListener('click', function() {
+        alert('Downloading all Gerber files as ZIP (In a production app, this would download a ZIP with all files)');
+    });
+    
+    // Show design suggestions based on requirements
+    const suggestions = generateSuggestions(requestData);
+    if (suggestions.length > 0) {
+        const suggestionsContainer = document.getElementById('suggestionsContainer');
+        const suggestionsList = document.getElementById('suggestionsList');
+        
+        suggestionsList.innerHTML = '';
+        suggestions.forEach(suggestion => {
+            const item = document.createElement('div');
+            item.className = 'alert alert-info mb-2';
+            item.innerHTML = `<i class="fas fa-lightbulb me-2"></i> ${suggestion}`;
+            suggestionsList.appendChild(item);
+        });
+        
+        suggestionsContainer.style.display = 'block';
+    }
+}
+
+/**
+ * Generate a URL for a PCB preview image
+ * @param {Object} requestData - The request data
+ * @param {string} view - The view type ('front' or 'back')
+ * @returns {string} The preview image URL
+ */
+function generatePreviewImageUrl(requestData, view = 'front') {
+    const width = Math.round(requestData.board_params.width);
+    const height = Math.round(requestData.board_params.height);
+    
+    // For demo, use placeholder image with parameters
+    const color = view === 'front' ? '1e8f5e' : '2563eb';
+    
+    // Include component names in the placeholder text
+    let componentText = '';
+    if (requestData.components && requestData.components.length > 0) {
+        componentText = ' with ' + requestData.components.map(c => c.name).join(', ');
+        if (componentText.length > 30) {
+            componentText = componentText.substring(0, 30) + '...';
+        }
+    }
+    
+    return `https://via.placeholder.com/600x400/${color}/ffffff?text=PCB+${width}x${height}mm${componentText}`;
+}
+
+/**
+ * Generate design suggestions based on requirements
+ * @param {Object} requestData - The request data
+ * @returns {string[]} Array of suggestion strings
+ */
+function generateSuggestions(requestData) {
+    const requirements = requestData.requirements.toLowerCase();
+    const suggestions = [];
+    
+    // Check for component-specific suggestions
+    const hasArduino = requestData.components.some(c => 
+        c.name.toLowerCase().includes('arduino') || 
+        c.name.toLowerCase().includes('atmega') ||
+        c.name.toLowerCase().includes('microcontroller'));
+    
+    const hasRegulator = requestData.components.some(c => 
+        c.name.toLowerCase().includes('regulator') || 
+        c.name.toLowerCase().includes('7805') ||
+        c.name.toLowerCase().includes('power'));
+    
+    // Add suggestions based on components and requirements
+    if (hasArduino) {
+        suggestions.push('Add decoupling capacitors (0.1μF) near the microcontroller power pins.');
+    }
+    
+    if (hasRegulator) {
+        suggestions.push('Include input and output capacitors for the voltage regulator to improve stability.');
+    }
+    
+    // Check requirements-based suggestions
+    if (requirements.includes('sensor') || requirements.includes('measure')) {
+        suggestions.push('Add filtering capacitors near analog sensor inputs to reduce noise.');
+    }
+    
+    if (requirements.includes('power') || requirements.includes('battery')) {
+        suggestions.push('Include a power indicator LED and reverse polarity protection.');
+    }
+    
+    if (requirements.includes('led') || requirements.includes('light')) {
+        suggestions.push('Add current-limiting resistors for LEDs based on your power supply voltage.');
+    }
+    
+    if (requirements.includes('motor') || requirements.includes('driver')) {
+        suggestions.push('Use separate power and ground planes for motor circuits to isolate noise.');
+    }
+    
+    // Check board parameter suggestions
+    if (requestData.board_params.width < 50 || requestData.board_params.height < 50) {
+        suggestions.push('Your board is quite small. Consider increasing dimensions for easier component placement.');
+    }
+    
+    if (requestData.board_params.layers === 1 && requestData.components.length > 3) {
+        suggestions.push('For designs with multiple components, consider using a double-sided board for easier routing.');
+    }
+    
+    return suggestions;
+}
+
+/**
+ * Add text to the requirements field based on a template
+ * @param {string} suggestion - The template suggestion to add
+ */
+window.addSuggestion = function(suggestion) {
+    const requirementsField = document.getElementById('requirements');
+    if (requirementsField.value.trim() === '') {
+        switch(suggestion) {
+            case 'Arduino':
+                requirementsField.value = 'An Arduino-based circuit that reads from analog sensors and controls multiple LEDs. It should be powered by a 9V battery with an on/off switch.';
+                break;
+            case 'Power Supply':
+                requirementsField.value = 'A power supply circuit that converts 120V AC to 5V and 3.3V DC with at least 1A current capacity for each output. Include proper filtering and safety features.';
+                break;
+            case 'LED Controller':
+                requirementsField.value = 'An LED controller that can drive 8 high-power RGB LEDs with individual brightness control. The circuit should accept 12V input and include proper current limiting for each channel.';
+                break;
+            case 'Sensor Interface':
+                requirementsField.value = 'A sensor interface board that can connect to temperature, humidity, and pressure sensors. It should include signal conditioning circuits and an I2C interface to connect to a main control board.';
+                break;
+            case 'Motor Driver':
+                requirementsField.value = 'A motor driver circuit for two DC motors with direction control and PWM speed adjustment. The circuit should handle motors that operate at 6-12V with up to 2A current draw each.';
+                break;
+        }
+    } else {
+        // If there's already text, ask before replacing
+        if (confirm('Replace current description with template?')) {
+            switch(suggestion) {
+                case 'Arduino':
+                    requirementsField.value = 'An Arduino-based circuit that reads from analog sensors and controls multiple LEDs. It should be powered by a 9V battery with an on/off switch.';
+                    break;
+                case 'Power Supply':
+                    requirementsField.value = 'A power supply circuit that converts 120V AC to 5V and 3.3V DC with at least 1A current capacity for each output. Include proper filtering and safety features.';
+                    break;
+                case 'LED Controller':
+                    requirementsField.value = 'An LED controller that can drive 8 high-power RGB LEDs with individual brightness control. The circuit should accept 12V input and include proper current limiting for each channel.';
+                    break;
+                case 'Sensor Interface':
+                    requirementsField.value = 'A sensor interface board that can connect to temperature, humidity, and pressure sensors. It should include signal conditioning circuits and an I2C interface to connect to a main control board.';
+                    break;
+                case 'Motor Driver':
+                    requirementsField.value = 'A motor driver circuit for two DC motors with direction control and PWM speed adjustment. The circuit should handle motors that operate at 6-12V with up to 2A current draw each.';
+                    break;
+            }
+        }
+    }
+};
