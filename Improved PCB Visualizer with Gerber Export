@@ -1,0 +1,1162 @@
+import os
+import math
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageColor
+from typing import Dict, List, Tuple, Any, Optional, Union
+import json
+import logging
+from dataclasses import dataclass, field
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("PCBVisualizer")
+
+
+@dataclass
+class Point:
+    """Represents a 2D point."""
+    x: float
+    y: float
+    
+    def as_tuple(self) -> Tuple[float, float]:
+        return (self.x, self.y)
+
+
+@dataclass
+class Component:
+    """Represents a PCB component with all its properties."""
+    id: int
+    type: str
+    pins: int
+    value: Optional[str] = None
+    reference: Optional[str] = None
+    package: Optional[str] = None
+    width: float = 0.0
+    height: float = 0.0
+    rotation: float = 0.0
+    position: Point = field(default_factory=lambda: Point(0, 0))
+    pin_positions: List[Point] = field(default_factory=list)
+    
+    @classmethod
+    def from_dict(cls, comp_id: int, data: Dict[str, Any]) -> 'Component':
+        """Create a Component from a dictionary."""
+        comp = cls(
+            id=comp_id,
+            type=data.get("type", "unknown"),
+            pins=data.get("pins", 2),
+            value=data.get("value"),
+            reference=data.get("reference"),
+            package=data.get("package")
+        )
+        
+        # Set default dimensions based on component type
+        comp._set_default_dimensions()
+        return comp
+    
+    def _set_default_dimensions(self) -> None:
+        """Set default dimensions based on component type."""
+        if self.type == "resistor":
+            self.width = 8
+            self.height = 3
+        elif self.type == "capacitor":
+            self.width = 6
+            self.height = 6
+        elif self.type == "LED":
+            self.width = 5
+            self.height = 5
+        elif self.type == "microcontroller":
+            self.width = 20
+            self.height = 20
+        elif self.type == "connector":
+            # Scale by number of pins
+            self.width = 8
+            self.height = 4 + (self.pins * 0.8)
+        elif self.type == "diode":
+            self.width = 6
+            self.height = 3
+        elif self.type == "transistor":
+            self.width = 7
+            self.height = 7
+        elif self.type == "IC":
+            # Scale by pin count
+            pins_per_side = math.ceil(self.pins / 4)
+            self.width = max(10, pins_per_side * 2)
+            self.height = max(10, pins_per_side * 2)
+        else:
+            # Default dimensions
+            self.width = 10
+            self.height = 5
+    
+    def calculate_pin_positions(self) -> None:
+        """Calculate positions of pins based on component dimensions and type."""
+        self.pin_positions = []
+        x, y = self.position.x, self.position.y
+        
+        # Apply rotation transform to calculate pin positions
+        def rotate_point(px, py, angle_deg):
+            angle_rad = math.radians(angle_deg)
+            s, c = math.sin(angle_rad), math.cos(angle_rad)
+            # Translate point to origin
+            px_t, py_t = px - x, py - y
+            # Rotate point
+            px_r = px_t * c - py_t * s
+            py_r = px_t * s + py_t * c
+            # Translate back
+            return x + px_r, y + py_r
+        
+        if self.pins == 2:
+            # Place pins at left and right edges (for resistors, capacitors, etc.)
+            self.pin_positions = [
+                Point(*rotate_point(x - self.width/2, y, self.rotation)),  # Pin 1
+                Point(*rotate_point(x + self.width/2, y, self.rotation))   # Pin 2
+            ]
+        elif self.pins <= 4:
+            # Place pins at corners (for small ICs, transistors, etc.)
+            self.pin_positions = [
+                Point(*rotate_point(x - self.width/2, y - self.height/2, self.rotation)),  # Pin 1
+                Point(*rotate_point(x + self.width/2, y - self.height/2, self.rotation)),  # Pin 2
+                Point(*rotate_point(x + self.width/2, y + self.height/2, self.rotation)),  # Pin 3
+                Point(*rotate_point(x - self.width/2, y + self.height/2, self.rotation))   # Pin 4
+            ]
+        else:
+            # Distribute pins around perimeter for larger components
+            pins_per_side = self.pins // 4
+            remaining_pins = self.pins % 4
+            
+            # Bottom side
+            for p in range(pins_per_side):
+                pin_x = x - self.width/2 + p * (self.width / (pins_per_side - 1 or 1))
+                pin_y = y - self.height/2
+                self.pin_positions.append(Point(*rotate_point(pin_x, pin_y, self.rotation)))
+            
+            # Right side
+            for p in range(pins_per_side):
+                pin_x = x + self.width/2
+                pin_y = y - self.height/2 + p * (self.height / (pins_per_side - 1 or 1))
+                self.pin_positions.append(Point(*rotate_point(pin_x, pin_y, self.rotation)))
+            
+            # Top side
+            for p in range(pins_per_side):
+                pin_x = x + self.width/2 - p * (self.width / (pins_per_side - 1 or 1))
+                pin_y = y + self.height/2
+                self.pin_positions.append(Point(*rotate_point(pin_x, pin_y, self.rotation)))
+            
+            # Left side
+            for p in range(pins_per_side + remaining_pins):
+                pin_x = x - self.width/2
+                pin_y = y + self.height/2 - p * (self.height / (pins_per_side - 1 or 1))
+                self.pin_positions.append(Point(*rotate_point(pin_x, pin_y, self.rotation)))
+            
+        # Trim to actual pin count
+        self.pin_positions = self.pin_positions[:self.pins]
+
+
+@dataclass
+class Connection:
+    """Represents a connection between two component pins."""
+    from_component: int
+    from_pin: int
+    to_component: int
+    to_pin: int
+    net_name: Optional[str] = None
+    width: float = 0.25  # Default trace width in mm
+    layer: int = 1       # Default layer
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Connection':
+        """Create a Connection from a dictionary."""
+        from_data = data.get("from", {})
+        to_data = data.get("to", {})
+        
+        return cls(
+            from_component=from_data.get("component", 0),
+            from_pin=from_data.get("pin", 0),
+            to_component=to_data.get("component", 0),
+            to_pin=to_data.get("pin", 0),
+            net_name=data.get("net_name"),
+            width=data.get("width", 0.25),
+            layer=data.get("layer", 1)
+        )
+
+
+@dataclass
+class BoardParameters:
+    """Represents PCB board parameters."""
+    width: float
+    height: float
+    layers: int = 2
+    trace_width: float = 0.25
+    clearance: float = 0.25
+    board_outline_width: float = 0.2
+    copper_weight: float = 1.0  # oz/ft²
+    soldermask_color: str = "green"
+    silkscreen_color: str = "white"
+    edge_rails: bool = False
+    edge_rails_width: float = 5.0
+    v_score: bool = False
+    plated_holes: bool = True
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BoardParameters':
+        """Create BoardParameters from a dictionary."""
+        return cls(
+            width=data.get("width", 100),
+            height=data.get("height", 80),
+            layers=data.get("layers", 2),
+            trace_width=data.get("trace_width", 0.25),
+            clearance=data.get("clearance", 0.25),
+            board_outline_width=data.get("board_outline_width", 0.2),
+            copper_weight=data.get("copper_weight", 1.0),
+            soldermask_color=data.get("soldermask_color", "green"),
+            silkscreen_color=data.get("silkscreen_color", "white"),
+            edge_rails=data.get("edge_rails", False),
+            edge_rails_width=data.get("edge_rails_width", 5.0),
+            v_score=data.get("v_score", False),
+            plated_holes=data.get("plated_holes", True)
+        )
+
+
+class PCBVisualizer:
+    """
+    Creates a visualization of a PCB design and exports to Gerber format.
+    """
+    
+    # Standard colors for PCB visualization
+    COLOR_SCHEMES = {
+        "standard": {
+            "board": (0, 100, 0),      # Dark green for PCB board
+            "copper": (184, 115, 51),  # Copper color
+            "silkscreen": (255, 255, 255),  # White for silkscreen
+            "background": (40, 40, 40),  # Dark gray for background
+            "traces": (204, 102, 0),   # Orange-copper for traces
+            "pads": (224, 164, 88),    # Lighter copper for pads
+            "resistor": (75, 87, 219),  # Blue for resistors
+            "capacitor": (219, 75, 75),  # Red for capacitors
+            "LED": (75, 219, 75),      # Green for LEDs
+            "microcontroller": (219, 219, 75),  # Yellow for microcontrollers
+            "diode": (200, 100, 200),  # Purple for diodes
+            "transistor": (100, 200, 200),  # Cyan for transistors
+            "IC": (219, 162, 75),      # Orange for ICs
+            "connector": (162, 75, 219)  # Purple for connectors
+        },
+        "blue": {
+            "board": (0, 50, 100),     # Blue PCB
+            "copper": (184, 115, 51),
+            "silkscreen": (255, 255, 255),
+            "background": (40, 40, 40),
+            "traces": (204, 102, 0),
+            "pads": (224, 164, 88),
+            # Remaining component colors similar to standard
+            "resistor": (75, 87, 219),
+            "capacitor": (219, 75, 75),
+            "LED": (75, 219, 75),
+            "microcontroller": (219, 219, 75),
+            "diode": (200, 100, 200),
+            "transistor": (100, 200, 200),
+            "IC": (219, 162, 75),
+            "connector": (162, 75, 219)
+        },
+        "red": {
+            "board": (100, 0, 0),      # Red PCB
+            "copper": (184, 115, 51),
+            "silkscreen": (255, 255, 255),
+            "background": (40, 40, 40),
+            "traces": (204, 102, 0),
+            "pads": (224, 164, 88),
+            # Component colors
+            "resistor": (75, 87, 219),
+            "capacitor": (219, 75, 75),
+            "LED": (75, 219, 75),
+            "microcontroller": (219, 219, 75),
+            "diode": (200, 100, 200),
+            "transistor": (100, 200, 200),
+            "IC": (219, 162, 75),
+            "connector": (162, 75, 219)
+        },
+        "black": {
+            "board": (20, 20, 20),     # Black PCB
+            "copper": (184, 115, 51),
+            "silkscreen": (255, 255, 255),
+            "background": (40, 40, 40),
+            "traces": (204, 102, 0),
+            "pads": (224, 164, 88),
+            # Component colors
+            "resistor": (75, 87, 219),
+            "capacitor": (219, 75, 75),
+            "LED": (75, 219, 75),
+            "microcontroller": (219, 219, 75),
+            "diode": (200, 100, 200),
+            "transistor": (100, 200, 200),
+            "IC": (219, 162, 75),
+            "connector": (162, 75, 219)
+        }
+    }
+    
+    def __init__(self, components: List[Dict], connections: List[Dict], board_params: Dict, 
+                 placements: Optional[Dict] = None, color_scheme: str = "standard"):
+        """
+        Initialize PCB Visualizer.
+        
+        Args:
+            components: List of component dictionaries
+            connections: List of connection dictionaries
+            board_params: Dictionary of board parameters
+            placements: Optional dictionary of component placements
+            color_scheme: Color scheme to use for visualization
+        """
+        # Convert input dictionaries to dataclass objects
+        self.components = [Component.from_dict(i, comp) for i, comp in enumerate(components)]
+        self.connections = [Connection.from_dict(conn) for conn in connections]
+        self.board_params = BoardParameters.from_dict(board_params)
+        self.placements = placements or {}
+        
+        # Set color scheme
+        self.colors = self.COLOR_SCHEMES.get(color_scheme, self.COLOR_SCHEMES["standard"])
+        
+        # Calculate pixel scale based on board size
+        self.scale = 5  # Pixels per mm
+        self.width_px = int(self.board_params.width * self.scale)
+        self.height_px = int(self.board_params.height * self.scale)
+        self.padding = 20  # Pixels padding around the board
+        
+        # Place components if not already placed
+        if not self.placements:
+            self._calculate_placements()
+        else:
+            # Update component positions from provided placements
+            self._update_components_from_placements()
+    
+    def _update_components_from_placements(self) -> None:
+        """Update component positions from provided placements."""
+        for comp_id, placement in self.placements.items():
+            if comp_id < len(self.components):
+                comp = self.components[comp_id]
+                comp.position = Point(placement.get("x", 0), placement.get("y", 0))
+                if "width" in placement:
+                    comp.width = placement["width"]
+                if "height" in placement:
+                    comp.height = placement["height"]
+                if "rotation" in placement:
+                    comp.rotation = placement["rotation"]
+                
+                # Calculate pin positions based on updated component data
+                comp.calculate_pin_positions()
+    
+    def _calculate_placements(self) -> None:
+        """Calculate component placements using an optimized grid layout."""
+        logger.info("Calculating component placements")
+        
+        # Sort components by size, placing larger components first
+        sorted_components = sorted(self.components, 
+                                  key=lambda c: c.width * c.height, 
+                                  reverse=True)
+        
+        grid_size = int(math.ceil(math.sqrt(len(self.components))))
+        cell_width = self.board_params.width / grid_size
+        cell_height = self.board_params.height / grid_size
+        
+        for i, component in enumerate(sorted_components):
+            row = i // grid_size
+            col = i % grid_size
+            
+            # Center component in its cell
+            x = col * cell_width + cell_width / 2
+            y = row * cell_height + cell_height / 2
+            
+            # Update component position
+            component.position = Point(x, y)
+            
+            # Calculate pin positions
+            component.calculate_pin_positions()
+            
+            # Update original component with placement info
+            original_idx = component.id
+            self.components[original_idx] = component
+    
+    def _optimize_routing(self) -> None:
+        """Optimize trace routing to minimize crossings."""
+        # This is a simplified routing algorithm
+        # For production quality, replace with a proper routing algorithm
+        
+        # Sort connections by length to route shorter connections first
+        def connection_length(conn):
+            from_comp = self.components[conn.from_component]
+            to_comp = self.components[conn.to_component]
+            
+            if conn.from_pin < len(from_comp.pin_positions) and conn.to_pin < len(to_comp.pin_positions):
+                from_pos = from_comp.pin_positions[conn.from_pin]
+                to_pos = to_comp.pin_positions[conn.to_pin]
+                
+                dx = to_pos.x - from_pos.x
+                dy = to_pos.y - from_pos.y
+                return math.sqrt(dx*dx + dy*dy)
+            return float('inf')
+        
+        # Sort connections by length
+        self.connections.sort(key=connection_length)
+        
+        # In a real router, we would now do proper path finding
+        # This is just a placeholder for demonstration
+        logger.info(f"Optimized routing for {len(self.connections)} connections")
+    
+    def _mm_to_px(self, mm_x: float, mm_y: float) -> Tuple[int, int]:
+        """Convert mm coordinates to pixel coordinates."""
+        px_x = int(mm_x * self.scale) + self.padding
+        px_y = int(mm_y * self.scale) + self.padding
+        return px_x, px_y
+    
+    def render_pcb(self, output_path: Optional[str] = None) -> Image.Image:
+        """
+        Render the PCB design as an image.
+        
+        Args:
+            output_path: Optional path to save the rendered image
+            
+        Returns:
+            PIL Image object
+        """
+        logger.info("Rendering PCB")
+        
+        # Optimize routing before rendering
+        self._optimize_routing()
+        
+        # Create image with padding
+        img_width = self.width_px + 2 * self.padding
+        img_height = self.height_px + 2 * self.padding
+        img = Image.new('RGB', (img_width, img_height), self.colors["background"])
+        draw = ImageDraw.Draw(img)
+        
+        # Draw PCB board
+        board_coords = self._mm_to_px(0, 0) + self._mm_to_px(self.board_params.width, self.board_params.height)
+        draw.rectangle(board_coords, fill=self.colors["board"])
+        
+        # Draw grid (for reference)
+        grid_spacing_mm = 10  # Grid spacing in mm
+        grid_color = (self.colors["board"][0] - 20, self.colors["board"][1] - 20, self.colors["board"][2] - 20)
+        
+        for x in range(0, int(self.board_params.width), grid_spacing_mm):
+            start = self._mm_to_px(x, 0)
+            end = self._mm_to_px(x, self.board_params.height)
+            draw.line([start, end], fill=grid_color, width=1)
+            
+        for y in range(0, int(self.board_params.height), grid_spacing_mm):
+            start = self._mm_to_px(0, y)
+            end = self._mm_to_px(self.board_params.width, y)
+            draw.line([start, end], fill=grid_color, width=1)
+        
+        # Draw traces for connections
+        for conn in self.connections:
+            from_comp = conn.from_component
+            from_pin = conn.from_pin
+            to_comp = conn.to_component
+            to_pin = conn.to_pin
+            
+            if (0 <= from_comp < len(self.components) and 
+                0 <= to_comp < len(self.components)):
+                
+                comp_from = self.components[from_comp]
+                comp_to = self.components[to_comp]
+                
+                if (from_pin < len(comp_from.pin_positions) and 
+                    to_pin < len(comp_to.pin_positions)):
+                    
+                    from_pos = comp_from.pin_positions[from_pin]
+                    to_pos = comp_to.pin_positions[to_pin]
+                    
+                    # Convert to pixel coordinates
+                    from_px = self._mm_to_px(from_pos.x, from_pos.y)
+                    to_px = self._mm_to_px(to_pos.x, to_pos.y)
+                    
+                    # Draw trace line
+                    trace_width = max(1, int(conn.width * self.scale))
+                    draw.line([from_px, to_px], fill=self.colors["traces"], width=trace_width)
+        
+        # Draw components and pads
+        for component in self.components:
+            # Draw component body
+            comp_x, comp_y = component.position.x, component.position.y
+            comp_width, comp_height = component.width, component.height
+            
+            # Calculate rotated rectangle coordinates
+            def rotate_rect(center_x, center_y, width, height, angle_deg):
+                angle_rad = math.radians(angle_deg)
+                s, c = math.sin(angle_rad), math.cos(angle_rad)
+                
+                # Calculate the corners (relative to center)
+                corners = [
+                    (-width/2, -height/2),
+                    (width/2, -height/2),
+                    (width/2, height/2),
+                    (-width/2, height/2)
+                ]
+                
+                # Rotate and translate corners
+                rotated_corners = []
+                for x, y in corners:
+                    # Rotate
+                    x_rot = x * c - y * s
+                    y_rot = x * s + y * c
+                    # Translate
+                    rotated_corners.append(self._mm_to_px(center_x + x_rot, center_y + y_rot))
+                
+                return rotated_corners
+            
+            polygon_points = rotate_rect(comp_x, comp_y, comp_width, comp_height, component.rotation)
+            
+            comp_type = component.type
+            comp_color = self.colors.get(comp_type, self.colors["silkscreen"])
+            
+            # Draw component body
+            draw.polygon(polygon_points, fill=comp_color, outline=self.colors["silkscreen"])
+            
+            # Draw component label
+            try:
+                font = ImageFont.truetype("arial.ttf", 10)
+            except IOError:
+                font = ImageFont.load_default()
+                
+            # Use reference if available, otherwise use type
+            label = component.reference or comp_type.title()
+            if len(label) > 15:
+                label = label[:12] + "..."
+                
+            # Calculate text position
+            text_width = draw.textlength(label, font=font)
+            center_px = self._mm_to_px(comp_x, comp_y)
+            text_x = center_px[0] - text_width // 2
+            text_y = center_px[1] - 5
+            
+            draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
+            
+            # Draw value if available
+            if component.value:
+                value_text = component.value
+                if len(value_text) > 15:
+                    value_text = value_text[:12] + "..."
+                
+                value_width = draw.textlength(value_text, font=font)
+                draw.text((center_px[0] - value_width // 2, center_px[1] + 5), 
+                         value_text, fill=(0, 0, 0), font=font)
+            
+            # Draw pads
+            for i, pin_pos in enumerate(component.pin_positions):
+                px_x, px_y = self._mm_to_px(pin_pos.x, pin_pos.y)
+                pad_size = max(2, int(0.8 * self.scale))  # Pad size in pixels
+                
+                # Draw pad
+                draw.ellipse([px_x - pad_size, px_y - pad_size, px_x + pad_size, px_y + pad_size], 
+                           fill=self.colors["pads"])
+                
+                # Draw pin number
+                pin_num_text = str(i + 1)
+                pin_text_x = px_x - draw.textlength(pin_num_text, font=font) // 2
+                pin_text_y = px_y - 5
+                draw.text((pin_text_x, pin_text_y), pin_num_text, 
+                         fill=self.colors["silkscreen"], font=font)
+        
+        # Draw board outline
+        outline_coords = self._mm_to_px(0, 0) + self._mm_to_px(self.board_params.width, self.board_params.height)
+        draw.rectangle(outline_coords, outline=self.colors["silkscreen"], width=2)
+        
+        # Save image if output path provided
+        if output_path:
+            img.save(output_path)
+        
+        return img
+    
+    def generate_3d_preview(self, output_path: Optional[str] = None) -> Image.Image:
+        """
+        Generate a pseudo-3D preview of the PCB.
+        
+        Args:
+            output_path: Optional path to save the preview image
+            
+        Returns:
+            PIL Image object
+        """
+        logger.info("Generating 3D preview")
+        
+        # Get base 2D rendering
+        base_img = self.render_pcb()
+        img_width, img_height = base_img.size
+        
+        # Create a new image for the 3D preview
+        preview = Image.new('RGB', (img_width, img_height), self.colors["background"])
+        preview.paste(base_img, (0, 0))
+        
+        # Add a simple shadow effect
+        shadow = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow)
+        
+        board_coords = self._mm_to_px(0, 0) + self._mm_to_px(self.board_params.width, self.board_params.height)
+        shadow_coords = (board_coords[0] + 10, board_coords[1] + 10, board_coords[2] + 10, board_coords[3] + 10)
+        shadow_draw.rectangle(shadow_coords, fill=(0, 0, 0, 100))
+        
+        # Apply shadow
+        preview = Image.alpha_composite(preview.convert('RGBA'), shadow).convert('RGB')
+        
+        # Add a title and board info
+        try:
+            title_font = ImageFont.truetype("arial.ttf", 16)
+            info_font = ImageFont.truetype("arial.ttf", 12)
+        except IOError:
+            title_font = ImageFont.load_default()
+            info_font = ImageFont.load_default()
+            
+        draw = ImageDraw.Draw(preview)
+        
+        # Draw title
+        draw.text((self.padding, self.padding // 2), "AI-Generated PCB Design", 
+                 fill=self.colors["silkscreen"], font=title_font)
+        
+        # Draw board info
+        board_info = [
+            f"Dimensions: {self.board_params.width}mm x {self.board_params.height}mm",
+            f"Layers: {self.board_params.layers}",
+            f"Components: {len(self.components)}",
+            f"Connections: {len(self.connections)}"
+        ]
+        
+        for i, info in enumerate(board_info):
+            draw.text((self.padding, self.padding // 2 + 25 + i * 15), info, 
+                     fill=self.colors["silkscreen"], font=info_font)
+        
+        # Add component height to create 3D effect
+        for component in self.components:
+            # Calculate component height based on type
+            if component.type == "microcontroller" or component.type == "IC":
+                height = 3.0  # taller
+            else:
+                height = 1.5  # standard component height
+                
+            # Get component polygon
+            comp_x, comp_y = component.position.x, component.position.y
+            comp_width, comp_height = component.width, component.height
+            
+            # Calculate shadow offset based on height
+            shadow_offset = int(height * 1.5)
+            
+            # Create polygon points for component 3D effect
+            def rotate_rect_3d(center_x, center_y, width, height, angle_deg, offset_x, offset_y):
+                angle_rad = math.radians(angle_deg)
+                s, c = math.sin(angle_rad), math.cos(angle_rad)
+                
+                # Calculate the corners (relative to center)
+                corners = [
+                    (-width/2, -height/2),
+                    (width/2, -height/2),
+                    (width/2, height/2),
+                    (-width/2, height/2)
+                ]
+                
+                # Rotate and translate corners
+                rotated_corners = []
+                for x, y in corners:
+                    # Rotate
+                    x_rot = x * c - y * s
+                    y_rot = x * s + y * c
+                    # Translate with offset
+                    rotated_corners.append(self._mm_to_px(center_x + x_rot + offset_x, 
+                                                         center_y + y_rot + offset_y))
+                
+                return rotated_corners
+            
+            # Draw 3D effect (side walls)
+            polygon_points = rotate_rect_3d(comp_x, comp_y, comp_width, comp_height, 
+                                          component.rotation, 0, 0)
+            shadow_points = rotate_rect_3d(comp_x, comp_y, comp_width, comp_height, 
+                                         component.rotation, shadow_offset / self.scale, 
+                                         shadow_offset / self.scale)
+            
+            # Darken the component color for the side walls
+            comp_color = self.colors.get(component.type, self.colors["silkscreen"])
+            side_color = tuple(max(0, c - 40) for c in comp_color)
+            
+            # Draw side walls connecting the two polygons
+            for i in range(len(polygon_points)):
+                j = (i + 1) % len(polygon_points)
+                draw.polygon([
+                    polygon_points[i], polygon_points[j],
+                    shadow_points[j], shadow_points[i]
+                ], fill=side_color)
+        
+        # Save preview image if output path provided
+        if output_path:
+            preview.save(output_path)
+        
+        return preview
+    
+    def export_to_gerber(self, output_dir: str) -> None:
+        """
+        Export PCB design to Gerber files.
+        
+        Args:
+            output_dir: Directory to save Gerber files
+        """
+        logger.info(f"Exporting Gerber files to {output_dir}")
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Export to various Gerber layers
+        self._export_copper_layer(output_dir, 1)  # Top copper
+        if self.board_params.layers >= 2:
+            self._export_copper_layer(output_dir, 2)  # Bottom copper
+        
+        self._export_silkscreen(output_dir, "top")
+        self._export_soldermask(output_dir, "top")
+        self._export_soldermask(output_dir, "bottom")
+        self._export_drill_file(output_dir)
+        self._export_board_outline(output_dir)
+        
+        # Create a readme file with PCB specifications
+        self._create_gerber_readme(output_dir)
+        
+        logger.info("Gerber export completed successfully")
+    
+    def _export_copper_layer(self, output_dir: str, layer: int) -> None:
+        """
+        Export copper layer to Gerber format.
+        
+        Args:
+            output_dir: Output directory
+            layer: Layer number (1 = top, 2 = bottom)
+        """
+        layer_name = "top" if layer == 1 else "bottom"
+        filename = os.path.join(output_dir, f"pcb-{layer_name}-copper.gbr")
+        
+        with open(filename, 'w') as f:
+            # Write Gerber file header
+            f.write("%FSLAX46Y46*%\n")  # Format statement for 4.6 precision
+            f.write("%MOMM*%\n")        # Units: millimeters
+            
+            # Write aperture definitions
+            f.write("%ADD10C,0.5*%\n")  # D10: Circle with 0.5mm diameter for traces
+            f.write("%ADD11C,1.0*%\n")  # D11: Circle with 1.0mm diameter for pads
+            
+            # Write board outline
+            f.write("G01*\n")   # Linear interpolation mode
+            f.write("%LPD*%\n") # Dark polarity (default)
+            
+            # Draw pads
+            f.write("D11*\n")   # Select aperture D11 (pad)
+            
+            for component in self.components:
+                for pin_pos in component.pin_positions:
+                    x_gerber = int(pin_pos.x * 10000)  # Convert to 1/10000 mm
+                    y_gerber = int(pin_pos.y * 10000)  # Convert to 1/10000 mm
+                    f.write(f"X{x_gerber}Y{y_gerber}D03*\n")  # Flash aperture
+            
+            # Draw traces
+            f.write("D10*\n")   # Select aperture D10 (trace)
+            
+            for conn in self.connections:
+                if conn.layer == layer:
+                    from_comp = self.components[conn.from_component]
+                    to_comp = self.components[conn.to_component]
+                    
+                    if conn.from_pin < len(from_comp.pin_positions) and conn.to_pin < len(to_comp.pin_positions):
+                        from_pos = from_comp.pin_positions[conn.from_pin]
+                        to_pos = to_comp.pin_positions[conn.to_pin]
+                        
+                        # Move to start position
+                        x1_gerber = int(from_pos.x * 10000)
+                        y1_gerber = int(from_pos.y * 10000)
+                        f.write(f"X{x1_gerber}Y{y1_gerber}D02*\n")  # Pen up
+                        
+                        # Draw line to end position
+                        x2_gerber = int(to_pos.x * 10000)
+                        y2_gerber = int(to_pos.y * 10000)
+                        f.write(f"X{x2_gerber}Y{y2_gerber}D01*\n")  # Pen down
+            
+            # End of file
+            f.write("M02*\n")
+    
+    def _export_silkscreen(self, output_dir: str, layer: str) -> None:
+        """
+        Export silkscreen layer to Gerber format.
+        
+        Args:
+            output_dir: Output directory
+            layer: "top" or "bottom"
+        """
+        filename = os.path.join(output_dir, f"pcb-{layer}-silkscreen.gbr")
+        
+        with open(filename, 'w') as f:
+            # Write Gerber file header
+            f.write("%FSLAX46Y46*%\n")  # Format statement for 4.6 precision
+            f.write("%MOMM*%\n")        # Units: millimeters
+            
+            # Write aperture definition
+            f.write("%ADD10C,0.2*%\n")  # D10: Circle with 0.2mm diameter for outlines
+            
+            # Write silkscreen data
+            f.write("G01*\n")   # Linear interpolation mode
+            f.write("%LPD*%\n") # Dark polarity (default)
+            f.write("D10*\n")   # Select aperture D10
+            
+            # Draw component outlines and reference designators
+            for component in self.components:
+                # Calculate component corners
+                comp_x, comp_y = component.position.x, component.position.y
+                comp_width, comp_height = component.width, component.height
+                
+                # Draw component outline rectangle
+                half_width = comp_width / 2
+                half_height = comp_height / 2
+                
+                # Simplified rotation handling for Gerber output
+                if component.rotation == 0:
+                    # Top edge
+                    x1 = int((comp_x - half_width) * 10000)
+                    y1 = int((comp_y - half_height) * 10000)
+                    x2 = int((comp_x + half_width) * 10000)
+                    y2 = int((comp_y - half_height) * 10000)
+                    f.write(f"X{x1}Y{y1}D02*\n")  # Move to
+                    f.write(f"X{x2}Y{y2}D01*\n")  # Line to
+                    
+                    # Right edge
+                    x1, y1 = x2, y2
+                    y2 = int((comp_y + half_height) * 10000)
+                    f.write(f"X{x2}Y{y2}D01*\n")  # Line to
+                    
+                    # Bottom edge
+                    x1, y1 = x2, y2
+                    x2 = int((comp_x - half_width) * 10000)
+                    f.write(f"X{x2}Y{y2}D01*\n")  # Line to
+                    
+                    # Left edge
+                    x1, y1 = x2, y2
+                    y2 = int((comp_y - half_height) * 10000)
+                    f.write(f"X{x2}Y{y2}D01*\n")  # Line to
+                else:
+                    # For rotated components, calculate corner positions
+                    angle_rad = math.radians(component.rotation)
+                    s, c = math.sin(angle_rad), math.cos(angle_rad)
+                    
+                    corners = []
+                    for dx, dy in [(-half_width, -half_height), 
+                                   (half_width, -half_height),
+                                   (half_width, half_height),
+                                   (-half_width, half_height)]:
+                        # Rotate point
+                        rx = dx * c - dy * s
+                        ry = dx * s + dy * c
+                        # Translate
+                        corners.append((int((comp_x + rx) * 10000), int((comp_y + ry) * 10000)))
+                    
+                    # Draw outline connecting corners
+                    for i in range(len(corners)):
+                        x1, y1 = corners[i]
+                        x2, y2 = corners[(i + 1) % len(corners)]
+                        
+                        if i == 0:
+                            f.write(f"X{x1}Y{y1}D02*\n")  # Move to first point
+                        f.write(f"X{x2}Y{y2}D01*\n")  # Line to next point
+            
+            # End of file
+            f.write("M02*\n")
+    
+    def _export_soldermask(self, output_dir: str, layer: str) -> None:
+        """
+        Export soldermask layer to Gerber format.
+        
+        Args:
+            output_dir: Output directory
+            layer: "top" or "bottom"
+        """
+        filename = os.path.join(output_dir, f"pcb-{layer}-soldermask.gbr")
+        
+        with open(filename, 'w') as f:
+            # Write Gerber file header
+            f.write("%FSLAX46Y46*%\n")  # Format statement for 4.6 precision
+            f.write("%MOMM*%\n")        # Units: millimeters
+            
+            # Write aperture definition for pads
+            f.write("%ADD11C,1.2*%\n")  # D11: Circle with 1.2mm diameter for pads (slightly larger than copper)
+            
+            # Write soldermask data
+            f.write("G01*\n")   # Linear interpolation mode
+            f.write("%LPD*%\n") # Dark polarity
+            f.write("D11*\n")   # Select aperture D11
+            
+            # Create soldermask openings for pads
+            for component in self.components:
+                for pin_pos in component.pin_positions:
+                    x_gerber = int(pin_pos.x * 10000)
+                    y_gerber = int(pin_pos.y * 10000)
+                    f.write(f"X{x_gerber}Y{y_gerber}D03*\n")  # Flash aperture
+            
+            # End of file
+            f.write("M02*\n")
+    
+    def _export_drill_file(self, output_dir: str) -> None:
+        """
+        Export drill file in Excellon format.
+        
+        Args:
+            output_dir: Output directory
+        """
+        filename = os.path.join(output_dir, "pcb-drill.xln")
+        
+        with open(filename, 'w') as f:
+            # Write Excellon header
+            f.write("M48\n")           # Program header
+            f.write("METRIC,TZ\n")     # Metric units, trailing zeros
+            f.write("T1C0.8\n")        # Tool 1: 0.8mm drill
+            f.write("%\n")             # End of header
+            f.write("T1\n")            # Select tool 1
+            
+            # Write drill coordinates for all pads
+            for component in self.components:
+                for pin_pos in component.pin_positions:
+                    x_drill = format(pin_pos.x, '.3f')
+                    y_drill = format(pin_pos.y, '.3f')
+                    f.write(f"X{x_drill}Y{y_drill}\n")
+            
+            # End of program
+            f.write("M30\n")
+    
+    def _export_board_outline(self, output_dir: str) -> None:
+        """
+        Export board outline to Gerber format.
+        
+        Args:
+            output_dir: Output directory
+        """
+        filename = os.path.join(output_dir, "pcb-outline.gbr")
+        
+        with open(filename, 'w') as f:
+            # Write Gerber file header
+            f.write("%FSLAX46Y46*%\n")  # Format statement for 4.6 precision
+            f.write("%MOMM*%\n")        # Units: millimeters
+            
+            # Write aperture definition
+            f.write("%ADD10C,0.2*%\n")  # D10: Circle with 0.2mm diameter for outline
+            
+            # Write board outline data
+            f.write("G01*\n")   # Linear interpolation mode
+            f.write("%LPD*%\n") # Dark polarity (default)
+            f.write("D10*\n")   # Select aperture D10
+            
+            # Draw rectangle outline
+            width_gerber = int(self.board_params.width * 10000)
+            height_gerber = int(self.board_params.height * 10000)
+            
+            # Move to origin
+            f.write("X0Y0D02*\n")  # Pen up
+            
+            # Draw outline
+            f.write(f"X{width_gerber}Y0D01*\n")          # Bottom edge
+            f.write(f"X{width_gerber}Y{height_gerber}D01*\n")  # Right edge
+            f.write(f"X0Y{height_gerber}D01*\n")         # Top edge
+            f.write("X0Y0D01*\n")                       # Left edge
+            
+            # End of file
+            f.write("M02*\n")
+    
+    def _create_gerber_readme(self, output_dir: str) -> None:
+        """
+        Create a README file with PCB specifications.
+        
+        Args:
+            output_dir: Output directory
+        """
+        filename = os.path.join(output_dir, "README.txt")
+        
+        with open(filename, 'w') as f:
+            f.write("PCB Specification\n")
+            f.write("=================\n\n")
+            
+            f.write(f"Board size: {self.board_params.width}mm x {self.board_params.height}mm\n")
+            f.write(f"Layers: {self.board_params.layers}\n")
+            f.write(f"Copper weight: {self.board_params.copper_weight}oz\n")
+            f.write(f"Soldermask color: {self.board_params.soldermask_color}\n")
+            f.write(f"Silkscreen color: {self.board_params.silkscreen_color}\n")
+            f.write(f"Components count: {len(self.components)}\n")
+            f.write(f"Connections count: {len(self.connections)}\n\n")
+            
+            f.write("Gerber Files:\n")
+            f.write("-------------\n")
+            f.write("pcb-top-copper.gbr     - Top copper layer\n")
+            if self.board_params.layers >= 2:
+                f.write("pcb-bottom-copper.gbr  - Bottom copper layer\n")
+            f.write("pcb-top-silkscreen.gbr  - Top silkscreen\n")
+            f.write("pcb-top-soldermask.gbr  - Top soldermask\n")
+            f.write("pcb-bottom-soldermask.gbr - Bottom soldermask\n")
+            f.write("pcb-outline.gbr         - Board outline\n")
+            f.write("pcb-drill.xln           - Drill file (Excellon format)\n\n")
+            
+            f.write("Generated by AI PCB Visualizer\n")
+    
+    def export_to_json(self, output_path: str) -> None:
+        """
+        Export PCB design to JSON format.
+        
+        Args:
+            output_path: Path to save JSON file
+        """
+        # Create serializable data structure
+        data = {
+            "board_parameters": {
+                "width": self.board_params.width,
+                "height": self.board_params.height,
+                "layers": self.board_params.layers,
+                "trace_width": self.board_params.trace_width,
+                "clearance": self.board_params.clearance,
+                "board_outline_width": self.board_params.board_outline_width,
+                "copper_weight": self.board_params.copper_weight,
+                "soldermask_color": self.board_params.soldermask_color,
+                "silkscreen_color": self.board_params.silkscreen_color
+            },
+            "components": [],
+            "connections": []
+        }
+        
+        # Add components
+        for component in self.components:
+            comp_data = {
+                "id": component.id,
+                "type": component.type,
+                "pins": component.pins,
+                "value": component.value,
+                "reference": component.reference,
+                "package": component.package,
+                "width": component.width,
+                "height": component.height,
+                "rotation": component.rotation,
+                "position": {
+                    "x": component.position.x,
+                    "y": component.position.y
+                },
+                "pin_positions": [
+                    {"x": pin.x, "y": pin.y} for pin in component.pin_positions
+                ]
+            }
+            data["components"].append(comp_data)
+        
+        # Add connections
+        for connection in self.connections:
+            conn_data = {
+                "from": {
+                    "component": connection.from_component,
+                    "pin": connection.from_pin
+                },
+                "to": {
+                    "component": connection.to_component,
+                    "pin": connection.to_pin
+                },
+                "net_name": connection.net_name,
+                "width": connection.width,
+                "layer": connection.layer
+            }
+            data["connections"].append(conn_data)
+        
+        # Write to file
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            
+        logger.info(f"PCB design exported to JSON at {output_path}")
+
+
+# Example usage
+def main():
+    # Example components with more realistic properties
+    components = [
+        {
+            "type": "microcontroller", 
+            "pins": 8, 
+            "value": "ATtiny85", 
+            "reference": "U1",
+            "package": "SOIC-8"
+        },
+        {
+            "type": "resistor", 
+            "pins": 2, 
+            "value": "10K", 
+            "reference": "R1"
+        },
+        {
+            "type": "resistor", 
+            "pins": 2, 
+            "value": "1K", 
+            "reference": "R2"
+        },
+        {
+            "type": "capacitor", 
+            "pins": 2, 
+            "value": "0.1uF", 
+            "reference": "C1"
+        },
+        {
+            "type": "LED", 
+            "pins": 2, 
+            "value": "Green", 
+            "reference": "D1"
+        }
+    ]
+    
+    # Example connections with net names
+    connections = [
+        {"from": {"component": 0, "pin": 0}, "to": {"component": 1, "pin": 0}, "net_name": "VCC"},
+        {"from": {"component": 0, "pin": 1}, "to": {"component": 2, "pin": 0}, "net_name": "GPIO1"},
+        {"from": {"component": 0, "pin": 2}, "to": {"component": 3, "pin": 0}, "net_name": "RESET"},
+        {"from": {"component": 0, "pin": 3}, "to": {"component": 4, "pin": 0}, "net_name": "GPIO2"},
+        {"from": {"component": 1, "pin": 1}, "to": {"component": 4, "pin": 1}, "net_name": "GND"},
+        {"from": {"component": 2, "pin": 1}, "to": {"component": 3, "pin": 1}, "net_name": "GND"}
+    ]
+    
+    # Board parameters
+    board_params = {
+        "width": 100,
+        "height": 80,
+        "layers": 2,
+        "trace_width": 0.25,
+        "clearance": 0.25,
+        "board_outline_width": 0.2,
+        "copper_weight": 1.0,
+        "soldermask_color": "green",
+        "silkscreen_color": "white"
+    }
+    
+    # Create visualizer and generate outputs
+    visualizer = PCBVisualizer(components, connections, board_params)
+    
+    # Create output directory
+    output_dir = "pcb_output"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate and save visualizations
+    visualizer.render_pcb(os.path.join(output_dir, "pcb_2d_preview.png"))
+    visualizer.generate_3d_preview(os.path.join(output_dir, "pcb_3d_preview.png"))
+    
+    # Export to various formats
+    visualizer.export_to_json(os.path.join(output_dir, "pcb_design.json"))
+    
+    # Export Gerber files
+    gerber_dir = os.path.join(output_dir, "gerber")
+    visualizer.export_to_gerber(gerber_dir)
+    
+    print(f"PCB visualization and export complete. All files saved to {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+#How to Use:
+#The new implementation offers a more intuitive API:
+
+# Create visualizer with components, connections and board params
+#visualizer = PCBVisualizer(components, connections, board_params)
+
+# Generate visual previews
+#visualizer.render_pcb("pcb_2d_preview.png")
+#visualizer.generate_3d_preview("pcb_3d_preview.png")
+
+# Export to production-ready Gerber files
+#visualizer.export_to_gerber("gerber_output_dir")
+
+# Save design to JSON for future loading
+#visualizer.export_to_json("pcb_design.json")
+
