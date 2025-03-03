@@ -1,0 +1,323 @@
+import os
+import json
+import tempfile
+import zipfile
+import base64
+from io import BytesIO
+from flask import Flask, request, jsonify, render_template, send_file
+from werkzeug.utils import secure_filename
+
+# Import our custom modules
+from datasheet_extractor import DatasheetExtractor
+from gerber_generator import GerberGenerator
+from pcb_visualizer import PCBVisualizer
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+class PCBDesigner:
+    def __init__(self):
+        self.datasheet_extractor = DatasheetExtractor()
+        self.components = []
+        self.board_params = {}
+        self.requirements = ""
+        self.component_library = {
+            "resistor": {"footprint": "R_0805_2012Metric", "pins": 2},
+            "capacitor": {"footprint": "C_0805_2012Metric", "pins": 2},
+            "LED": {"footprint": "LED_0805_2012Metric", "pins": 2},
+            "microcontroller": {"footprint": "LQFP-32_7x7mm_P0.8mm", "pins": 32},
+        }
+    
+    def process_datasheets(self, datasheets):
+        """Process datasheet information to extract component parameters"""
+        components = []
+        
+        for datasheet in datasheets:
+            # Extract data from datasheet text or file
+            if isinstance(datasheet, dict) and 'content' in datasheet:
+                # Process text content
+                result = self.datasheet_extractor.process_datasheet(datasheet['content'])
+                component = result['parameters']
+                
+                # Add component name if provided
+                if 'name' in datasheet:
+                    component['name'] = datasheet['name']
+                
+                # Add to components list if valid
+                if component.get('type') and component.get('type') != 'unknown':
+                    components.append(component)
+            elif isinstance(datasheet, str) and os.path.isfile(datasheet):
+                # Process datasheet file
+                result = self.datasheet_extractor.process_datasheet(datasheet)
+                component = result['parameters']
+                
+                # Add to components list if valid
+                if component.get('type') and component.get('type') != 'unknown':
+                    components.append(component)
+        
+        self.components = components
+        return components
+    
+    def analyze_requirements(self, requirements_text):
+        """Analyze the textual requirements to determine circuit needs"""
+        self.requirements = requirements_text
+        
+        # Simple keyword-based analysis
+        requirements_lower = requirements_text.lower()
+        circuit_needs = {
+            "power_regulation": any(word in requirements_lower for word in ["power", "voltage", "regulator", "supply"]),
+            "microcontroller": any(word in requirements_lower for word in ["microcontroller", "mcu", "processor", "control"]),
+            "led_indicators": any(word in requirements_lower for word in ["led", "indicator", "light", "display"]),
+            "sensors": any(word in requirements_lower for word in ["sensor", "measure", "detect", "monitor"]),
+        }
+        
+        # Add missing essential components based on requirements
+        if circuit_needs["power_regulation"] and not any(c.get('type') == 'regulator' for c in self.components):
+            self.components.append({'type': 'regulator', 'pins': 3, 'name': 'Power Regulator'})
+        
+        if circuit_needs["microcontroller"] and not any(c.get('type') == 'microcontroller' for c in self.components):
+            self.components.append({'type': 'microcontroller', 'pins': 32, 'name': 'Microcontroller'})
+        
+        if circuit_needs["led_indicators"] and not any(c.get('type') == 'LED' for c in self.components):
+            self.components.append({'type': 'LED', 'pins': 2, 'name': 'Indicator LED'})
+            # Add current limiting resistor for LED
+            if not any(c.get('type') == 'resistor' for c in self.components):
+                self.components.append({'type': 'resistor', 'pins': 2, 'name': 'Current Limiting Resistor'})
+        
+        if circuit_needs["sensors"] and not any(c.get('type') in ['sensor', 'analog sensor'] for c in self.components):
+            self.components.append({'type': 'sensor', 'pins': 3, 'name': 'Sensor'})
+        
+        return {
+            "circuit_needs": circuit_needs,
+            "components": self.components
+        }
+    
+    def set_board_parameters(self, params):
+        """Set the PCB board parameters"""
+        self.board_params = {
+            "width": params.get("width", 100),  # mm
+            "height": params.get("height", 80),  # mm
+            "layers": params.get("layers", 1),
+            "trace_width": params.get("trace_width", 0.25),  # mm
+        }
+        return self.board_params
+    
+    def create_schematic(self):
+        """Create a basic schematic connecting the components"""
+        connections = []
+        
+        # Find a microcontroller if present
+        mcu_index = -1
+        for i, comp in enumerate(self.components):
+            if comp.get("type") == "microcontroller":
+                mcu_index = i
+                break
+        
+        if mcu_index >= 0:
+            # If we have a microcontroller, connect components to it
+            mcu_pins_used = 0
+            mcu_pins_available = self.components[mcu_index].get("pins", 32)
+            
+            for i, comp in enumerate(self.components):
+                if i != mcu_index:
+                    comp_type = comp.get("type")
+                    pins_needed = min(comp.get("pins", 2), mcu_pins_available - mcu_pins_used)
+                    
+                    # Connect component pins to MCU
+                    for pin in range(pins_needed):
+                        if mcu_pins_used < mcu_pins_available:
+                            connections.append({
+                                "from": {"component": mcu_index, "pin": mcu_pins_used},
+                                "to": {"component": i, "pin": pin}
+                            })
+                            mcu_pins_used += 1
+        else:
+            # Simple daisy chain for linear circuits
+            for i in range(len(self.components) - 1):
+                connections.append({
+                    "from": {"component": i, "pin": 1},
+                    "to": {"component": i + 1, "pin": 0}
+                })
+                
+                # Add power connections if components need it
+                if i > 0 and self.components[i].get("pins", 2) > 2:
+                    # Assume pin 2 is power
+                    connections.append({
+                        "from": {"component": 0, "pin": 0},
+                        "to": {"component": i, "pin": 2}
+                    })
+        
+        return connections
+    
+    def generate_pcb_design(self, output_dir=None):
+        """Generate PCB design files and preview"""
+        if not output_dir:
+            output_dir = tempfile.mkdtemp()
+        
+        # Create connections between components
+        connections = self.create_schematic()
+        
+        # Generate Gerber files
+        gerber_dir = os.path.join(output_dir, "gerber")
+        os.makedirs(gerber_dir, exist_ok=True)
+        
+        gerber_generator = GerberGenerator(self.components, connections, self.board_params)
+        gerber_files = gerber_generator.generate_all_files(gerber_dir)
+        
+        # Generate visualization
+        preview_dir = os.path.join(output_dir, "preview")
+        os.makedirs(preview_dir, exist_ok=True)
+        
+        visualizer = PCBVisualizer(self.components, connections, self.board_params, gerber_generator.placements)
+        preview_2d_path = os.path.join(preview_dir, "pcb_2d_preview.png")
+        preview_3d_path = os.path.join(preview_dir, "pcb_3d_preview.png")
+        
+        visualizer.render_pcb(preview_2d_path)
+        visualizer.generate_3d_preview(preview_3d_path)
+        
+        return {
+            "gerber_dir": gerber_dir,
+            "gerber_files": gerber_files,
+            "preview_2d": preview_2d_path,
+            "preview_3d": preview_3d_path,
+            "components": self.components,
+            "connections": connections
+        }
+    
+    def create_zip_archive(self, gerber_dir):
+        """Create a ZIP archive of all Gerber files"""
+        memory_file = BytesIO()
+        
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(gerber_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, os.path.dirname(gerber_dir))
+                    zf.write(file_path, arcname)
+        
+        memory_file.seek(0)
+        return memory_file
+
+
+# API Routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/design_pcb', methods=['POST'])
+def design_pcb():
+    try:
+        data = request.json
+        
+        # Initialize PCB designer
+        designer = PCBDesigner()
+        
+        # Process datasheets
+        datasheets = data.get('datasheets', [])
+        components = designer.process_datasheets(datasheets)
+        
+        # Process requirements
+        requirements = data.get('requirements', '')
+        analysis = designer.analyze_requirements(requirements)
+        
+        # Set board parameters
+        designer.set_board_parameters(data.get('board_params', {}))
+        
+        # Generate PCB design
+        design_result = designer.generate_pcb_design()
+        
+        # Return results with base64 encoded previews
+        with open(design_result['preview_2d'], 'rb') as f:
+            preview_2d_base64 = base64.b64encode(f.read()).decode('utf-8')
+            
+        with open(design_result['preview_3d'], 'rb') as f:
+            preview_3d_base64 = base64.b64encode(f.read()).decode('utf-8')
+        
+        # Get list of Gerber files
+        gerber_files = []
+        for root, _, files in os.walk(design_result['gerber_dir']):
+            for file in files:
+                gerber_files.append({
+                    'name': file,
+                    'url': f'/api/download/gerber/{os.path.basename(design_result["gerber_dir"])}/{file}'
+                })
+        
+        return jsonify({
+            'status': 'success',
+            'preview_2d': f'data:image/png;base64,{preview_2d_base64}',
+            'preview_3d': f'data:image/png;base64,{preview_3d_base64}',
+            'gerber_files': gerber_files,
+            'download_all_url': f'/api/download/all/{os.path.basename(design_result["gerber_dir"])}',
+            'components': analysis['components']
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        })
+
+@app.route('/api/upload_datasheet', methods=['POST'])
+def upload_datasheet():
+    if 'file' not in request.files:
+        return jsonify({'status': 'error', 'message': 'No file part'})
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'status': 'error', 'message': 'No selected file'})
+    
+    if file:
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        # Extract data from datasheet
+        extractor = DatasheetExtractor()
+        result = extractor.process_datasheet(file_path)
+        
+        return jsonify({
+            'status': 'success',
+            'filename': filename,
+            'parameters': result['parameters'],
+            'raw_text_sample': result['raw_text_sample']
+        })
+
+@app.route('/api/download/gerber/<dir_name>/<filename>')
+def download_gerber_file(dir_name, filename):
+    temp_dir = tempfile.gettempdir()
+    gerber_dir = os.path.join(temp_dir, dir_name, "gerber")
+    file_path = os.path.join(gerber_dir, filename)
+    
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    else:
+        return jsonify({'status': 'error', 'message': 'File not found'})
+
+@app.route('/api/download/all/<dir_name>')
+def download_all_gerbers(dir_name):
+    temp_dir = tempfile.gettempdir()
+    gerber_dir = os.path.join(temp_dir, dir_name, "gerber")
+    
+    if os.path.exists(gerber_dir):
+        designer = PCBDesigner()
+        zip_file = designer.create_zip_archive(gerber_dir)
+        
+        return send_file(
+            zip_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='pcb_gerber_files.zip'
+        )
+    else:
+        return jsonify({'status': 'error', 'message': 'Gerber directory not found'})
+
+
+# Templates directory structure
+@app.route('/templates/index.html')
+def serve_template():
+    return render_template('index.html')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
