@@ -2,122 +2,471 @@ import os
 import re
 import json
 import tempfile
-from flask import Flask, request, jsonify, render_template
+import logging
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template, send_from_directory, abort
 import PyPDF2
 import pcbnew
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
+import spacy
 from gerber.render import GerberRenderer, RenderSettings
 from gerber.rs274x import GerberFile
 from gerber.excellon import ExcellonFile
+import matplotlib.pyplot as plt
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("CircuitIQ")
+
+# Initialize the NLP model
+try:
+    nlp = spacy.load("en_core_web_md")
+    logger.info("Loaded SpaCy NLP model")
+except Exception as e:
+    logger.error(f"Failed to load SpaCy model: {e}")
+    nlp = None
 
 app = Flask(__name__)
+
+# Configure file upload settings
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
+app.config['UPLOAD_FOLDER'] = os.path.join(tempfile.gettempdir(), 'circuit_iq_uploads')
+app.config['RESULTS_FOLDER'] = os.path.join(tempfile.gettempdir(), 'circuit_iq_results')
+Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
+Path(app.config['RESULTS_FOLDER']).mkdir(exist_ok=True)
+
+class DatasheetParser:
+    """Extract component information from datasheets"""
+    
+    def __init__(self):
+        self.component_patterns = {
+            # Enhanced regex patterns for more robust extraction
+            "part_number": [
+                r'Part\s*(?:Number|No|#|ID):\s*([\w\d-]+)', 
+                r'(?<![\w\d])([A-Z\d]{3,15}-[\w\d-]+)(?![\w\d])' # Common part number format
+            ],
+            "component_type": [
+                r'(?:Component)?\s*Type:\s*([\w\s-]+)', 
+                r'(?:Device|Component)\s*Category:\s*([\w\s-]+)'
+            ],
+            "package": [
+                r'Package(?:\s*Type)?:\s*([\w\d-]+)', 
+                r'Footprint:\s*([\w\d-]+)',
+                r'Case(?:\s*Style)?:\s*([\w\d-]+)'
+            ],
+            "pin_count": [
+                r'(?:Number\s*of\s*)?Pins:\s*(\d+)', 
+                r'Pin\s*Count:\s*(\d+)', 
+                r'(\d+)-Pin'
+            ],
+            "dimensions": [
+                r'Dimensions:?\s*([\d.]+\s*[×x]\s*[\d.]+\s*[×x]?\s*[\d.]*\s*mm)',
+                r'Size:?\s*([\d.]+\s*[×x]\s*[\d.]+\s*[×x]?\s*[\d.]*\s*mm)'
+            ],
+            "voltage_rating": [
+                r'(?:Voltage|Rating):\s*([\d.]+\s*V)',
+                r'(?:Max|Maximum)\s*Voltage:\s*([\d.]+\s*V)'
+            ],
+            "current_rating": [
+                r'(?:Current|Rating):\s*([\d.]+\s*[mu]?A)',
+                r'(?:Max|Maximum)\s*Current:\s*([\d.]+\s*[mu]?A)'
+            ],
+            "resistance": [
+                r'Resistance:\s*([\d.]+\s*[kM]?Ω)',
+                r'Value:\s*([\d.]+\s*[kM]?Ω)'
+            ],
+            "capacitance": [
+                r'Capacitance:\s*([\d.]+\s*[pnu]?F)',
+                r'Value:\s*([\d.]+\s*[pnu]?F)'
+            ]
+        }
+    
+    def extract_text_from_pdf(self, pdf_file):
+        """Extract text from PDF file"""
+        try:
+            text = ""
+            with open(pdf_file, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            logger.error(f"Failed to extract text from PDF: {e}")
+            return ""
+    
+    def extract_component_info(self, text):
+        """Extract component information from text using regex patterns"""
+        component = {}
+        
+        # Process each type of information
+        for info_type, patterns in self.component_patterns.items():
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    component[info_type] = match.group(1).strip()
+                    break
+        
+        # Determine component type based on extracted info or text content
+        component_type = self._determine_component_type(text, component)
+        if component_type:
+            component["type"] = component_type
+        
+        return component
+    
+    def _determine_component_type(self, text, extracted_info):
+        """Determine component type from text or extracted information"""
+        text_lower = text.lower()
+        
+        # Try to use extracted component_type
+        if "component_type" in extracted_info:
+            comp_type = extracted_info["component_type"].lower()
+            if "resistor" in comp_type:
+                return "resistor"
+            elif "capacitor" in comp_type:
+                return "capacitor"
+            elif "led" in comp_type or "light emitting diode" in comp_type:
+                return "LED"
+            elif "microcontroller" in comp_type or "mcu" in comp_type:
+                return "microcontroller"
+            elif "regulator" in comp_type or "voltage regulator" in comp_type:
+                return "regulator"
+            elif "transistor" in comp_type:
+                return "transistor"
+            elif "diode" in comp_type and "led" not in comp_type:
+                return "diode"
+        
+        # Analyze entire text
+        component_type_keywords = {
+            "resistor": ["resistor", "resistance", "ohm", "Ω"],
+            "capacitor": ["capacitor", "capacitance", "farad", "F", "pF", "nF", "µF"],
+            "LED": ["led", "light emitting diode", "light-emitting"],
+            "microcontroller": ["microcontroller", "mcu", "processor", "cpu", "arduino", "pic", "stm", "esp"],
+            "regulator": ["regulator", "voltage regulator", "ldo", "dc-dc"],
+            "transistor": ["transistor", "bjt", "fet", "mosfet"],
+            "diode": ["diode", "rectifier", "schottky"]
+        }
+        
+        # Count occurrences of keywords for each component type
+        scores = {comp_type: 0 for comp_type in component_type_keywords}
+        for comp_type, keywords in component_type_keywords.items():
+            for keyword in keywords:
+                scores[comp_type] += text_lower.count(keyword)
+        
+        # Return the component type with the highest score
+        if any(scores.values()):
+            return max(scores.items(), key=lambda x: x[1])[0]
+        
+        return "unknown"
 
 class PCBDesigner:
     def __init__(self):
         self.components = []
         self.board_params = {}
+        self.datasheet_parser = DatasheetParser()
         self.component_library = {
-            "resistor": {"footprint": "Resistor_SMD:R_0805_2012Metric", "pins": 2},
-            "capacitor": {"footprint": "Capacitor_SMD:C_0805_2012Metric", "pins": 2},
-            "LED": {"footprint": "LED_SMD:LED_0805_2012Metric", "pins": 2},
-            "microcontroller": {"footprint": "Package_QFP:LQFP-32_7x7mm_P0.8mm", "pins": 32},
+            "resistor": {
+                "footprint": "Resistor_SMD:R_0805_2012Metric", 
+                "pins": 2,
+                "description": "Standard SMD resistor",
+                "symbol": "Device:R"
+            },
+            "capacitor": {
+                "footprint": "Capacitor_SMD:C_0805_2012Metric", 
+                "pins": 2,
+                "description": "Standard SMD capacitor",
+                "symbol": "Device:C"
+            },
+            "LED": {
+                "footprint": "LED_SMD:LED_0805_2012Metric", 
+                "pins": 2,
+                "description": "Standard SMD LED",
+                "symbol": "Device:LED"
+            },
+            "microcontroller": {
+                "footprint": "Package_QFP:LQFP-32_7x7mm_P0.8mm", 
+                "pins": 32,
+                "description": "General-purpose microcontroller",
+                "symbol": "MCU_ST_STM32:STM32F103C8Tx"
+            },
+            "regulator": {
+                "footprint": "Package_TO_SOT_SMD:SOT-23-5", 
+                "pins": 5,
+                "description": "Voltage regulator",
+                "symbol": "Regulator_Linear:AP2112K-3.3"
+            },
+            "transistor": {
+                "footprint": "Package_TO_SOT_SMD:SOT-23", 
+                "pins": 3,
+                "description": "General-purpose transistor",
+                "symbol": "Device:Q_NPN_BEC"
+            },
+            "diode": {
+                "footprint": "Diode_SMD:D_SOD-123", 
+                "pins": 2,
+                "description": "General-purpose diode",
+                "symbol": "Device:D"
+            },
         }
     
-    def extract_from_datasheet(self, datasheet_text):
-        """Extract key component parameters from datasheet text"""
-        component = {}
-        
-        # Simple regex patterns to extract common parameters
-        component_type_match = re.search(r'Type:\s*([\w\s-]+)', datasheet_text, re.IGNORECASE)
-        if component_type_match:
-            component_type = component_type_match.group(1).strip().lower()
-            if "resistor" in component_type:
-                component["type"] = "resistor"
-            elif "capacitor" in component_type:
-                component["type"] = "capacitor"
-            elif "led" in component_type or "light emitting diode" in component_type:
-                component["type"] = "LED"
-            elif "microcontroller" in component_type or "mcu" in component_type:
-                component["type"] = "microcontroller"
+    def extract_from_datasheet(self, datasheet_path_or_text):
+        """Extract component data from a datasheet file or text"""
+        if os.path.exists(datasheet_path_or_text):
+            # It's a file path
+            if datasheet_path_or_text.lower().endswith('.pdf'):
+                datasheet_text = self.datasheet_parser.extract_text_from_pdf(datasheet_path_or_text)
             else:
-                component["type"] = "unknown"
+                # Assume it's a text file
+                with open(datasheet_path_or_text, 'r', encoding='utf-8', errors='ignore') as f:
+                    datasheet_text = f.read()
+        else:
+            # It's already text
+            datasheet_text = datasheet_path_or_text
         
-        # Extract part number
-        part_number_match = re.search(r'Part\s*(?:Number|No|#):\s*([\w\d-]+)', datasheet_text, re.IGNORECASE)
-        if part_number_match:
-            component["part_number"] = part_number_match.group(1).strip()
+        component = self.datasheet_parser.extract_component_info(datasheet_text)
         
-        # Extract package type
-        package_match = re.search(r'Package:\s*([\w\d-]+)', datasheet_text, re.IGNORECASE)
-        if package_match:
-            component["package"] = package_match.group(1).strip()
+        # Add default values from component library if available
+        if "type" in component and component["type"] in self.component_library:
+            lib_component = self.component_library[component["type"]]
+            if "pins" not in component and "pins" in lib_component:
+                component["pins"] = lib_component["pins"]
+            component["footprint"] = lib_component.get("footprint")
+            component["symbol"] = lib_component.get("symbol")
         
-        # Extract pin count
-        pin_count_match = re.search(r'Pins:\s*(\d+)', datasheet_text, re.IGNORECASE)
-        if pin_count_match:
-            component["pins"] = int(pin_count_match.group(1))
-        elif "type" in component and component["type"] in self.component_library:
-            component["pins"] = self.component_library[component["type"]]["pins"]
+        # Generate reference designator based on component type
+        if "type" in component:
+            component["reference"] = self._generate_reference(component["type"])
         
         return component
     
+    def _generate_reference(self, component_type):
+        """Generate a unique reference designator for a component"""
+        type_prefix = {
+            "resistor": "R",
+            "capacitor": "C",
+            "LED": "D",
+            "microcontroller": "U",
+            "regulator": "U",
+            "transistor": "Q",
+            "diode": "D",
+            "unknown": "X"
+        }.get(component_type, "X")
+        
+        # Count existing components of this type
+        count = sum(1 for c in self.components if c.get("type") == component_type)
+        return f"{type_prefix}{count + 1}"
+    
     def parse_requirements(self, requirements_text):
-        """Parse user requirements to understand circuit functionality"""
-        # Simple keyword extraction for circuit requirements
-        vectorizer = TfidfVectorizer(max_features=10)
+        """Parse user requirements using NLP to understand circuit functionality"""
+        parsed_data = {
+            "circuit_type": "unknown",
+            "keywords": [],
+            "circuit_needs": {},
+            "power_requirements": {},
+            "connectivity": []
+        }
+        
+        # Basic keyword extraction using TF-IDF
         try:
+            vectorizer = TfidfVectorizer(max_features=15, stop_words='english')
             tfidf_matrix = vectorizer.fit_transform([requirements_text])
             feature_names = vectorizer.get_feature_names_out()
-            keywords = feature_names.tolist()
-        except:
-            keywords = []
+            parsed_data["keywords"] = feature_names.tolist()
+        except Exception as e:
+            logger.warning(f"TF-IDF keyword extraction failed: {e}")
+            # Fallback to basic word extraction
+            parsed_data["keywords"] = [word for word in re.findall(r'\b\w+\b', requirements_text.lower()) 
+                                     if len(word) > 3 and word not in ['this', 'that', 'with', 'from', 'have', 'should']][:15]
+        
+        # Advanced NLP analysis if spaCy is available
+        if nlp:
+            try:
+                doc = nlp(requirements_text)
+                
+                # Extract power requirements
+                power_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(?:V|volts?)', re.IGNORECASE)
+                power_matches = power_pattern.findall(requirements_text)
+                if power_matches:
+                    parsed_data["power_requirements"]["voltage"] = float(power_matches[0])
+                
+                # Extract current requirements
+                current_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(?:mA|milliamps?|A|amps?)', re.IGNORECASE)
+                current_matches = current_pattern.findall(requirements_text)
+                if current_matches:
+                    parsed_data["power_requirements"]["current"] = float(current_matches[0])
+                
+                # Determine circuit type based on entities and keywords
+                circuit_types = {
+                    "power": ["power", "voltage", "regulator", "converter", "supply"],
+                    "sensor": ["sensor", "detect", "measure", "monitoring"],
+                    "control": ["control", "controller", "actuator", "motor", "drive"],
+                    "communication": ["communication", "wireless", "bluetooth", "wifi", "transmit", "receive"]
+                }
+                
+                # Score each circuit type
+                circuit_type_scores = {circuit_type: 0 for circuit_type in circuit_types}
+                for circuit_type, keywords in circuit_types.items():
+                    for keyword in keywords:
+                        if keyword in requirements_text.lower():
+                            circuit_type_scores[circuit_type] += 1
+                
+                # Set circuit type to the highest scoring type
+                if any(circuit_type_scores.values()):
+                    parsed_data["circuit_type"] = max(circuit_type_scores.items(), key=lambda x: x[1])[0]
+                
+                # Extract connectivity requirements
+                connectivity_terms = ["bluetooth", "wifi", "usb", "i2c", "spi", "uart", "ethernet"]
+                for term in connectivity_terms:
+                    if term.lower() in requirements_text.lower():
+                        parsed_data["connectivity"].append(term.lower())
+                
+            except Exception as e:
+                logger.warning(f"Advanced NLP analysis failed: {e}")
         
         # Determine if we need specific components based on requirements
-        circuit_needs = {
-            "power_regulation": any(word in requirements_text.lower() for word in ["power", "voltage", "regulator"]),
-            "microcontroller": any(word in requirements_text.lower() for word in ["microcontroller", "mcu", "processor"]),
-            "led_indicators": any(word in requirements_text.lower() for word in ["led", "indicator", "light"]),
-            "analog_sensing": any(word in requirements_text.lower() for word in ["sensor", "analog", "measure"]),
+        parsed_data["circuit_needs"] = {
+            "power_regulation": any(word in requirements_text.lower() 
+                                  for word in ["power", "voltage", "regulator", "supply", "battery"]),
+            "microcontroller": any(word in requirements_text.lower() 
+                                 for word in ["microcontroller", "mcu", "processor", "control", "arduino", "process"]),
+            "led_indicators": any(word in requirements_text.lower() 
+                               for word in ["led", "indicator", "light", "display", "visual"]),
+            "analog_sensing": any(word in requirements_text.lower() 
+                               for word in ["sensor", "analog", "measure", "detect", "temperature", "pressure"]),
+            "digital_io": any(word in requirements_text.lower() 
+                            for word in ["button", "switch", "input", "output", "digital", "io"]),
         }
         
-        return {"keywords": keywords, "circuit_needs": circuit_needs}
+        return parsed_data
     
     def set_board_parameters(self, params):
-        """Set basic board parameters"""
-        self.board_params = {
-            "width": params.get("width", 100),  # mm
-            "height": params.get("height", 80),  # mm
-            "layers": params.get("layers", 1),
-            "clearance": params.get("clearance", 0.25),  # mm
-            "trace_width": params.get("trace_width", 0.25),  # mm
+        """Set basic board parameters with validation"""
+        default_params = {
+            "width": 100,  # mm
+            "height": 80,  # mm
+            "layers": 2,   # default to 2-layer board
+            "clearance": 0.2,  # mm
+            "trace_width": 0.25,  # mm
+            "via_size": 0.6,  # mm
+            "via_drill": 0.3,  # mm
+            "edge_clearance": 1.0,  # mm
+            "grid_size": 0.1,  # mm
+            "text_size": 1.0,  # mm
+            "silk_line_width": 0.12,  # mm
+            "copper_weight": 1,  # oz (standard thickness)
+            "mask_solder": True,
+            "silkscreen": True
         }
+        
+        # Merge with default values and validate
+        self.board_params = default_params.copy()
+        if params:
+            for key, value in params.items():
+                if key in default_params:
+                    # Simple validation
+                    if isinstance(value, (int, float)) and value > 0:
+                        self.board_params[key] = value
+                    elif isinstance(value, bool) and key in ["mask_solder", "silkscreen"]:
+                        self.board_params[key] = value
+        
+        # Ensure minimum dimensions
+        self.board_params["width"] = max(20, self.board_params["width"])
+        self.board_params["height"] = max(20, self.board_params["height"])
+        
+        # Calculate board area
+        self.board_params["area"] = self.board_params["width"] * self.board_params["height"]
+        
+        return self.board_params
     
     def add_component(self, component):
-        """Add a component to the design"""
+        """Add a component to the design with validation"""
+        if not isinstance(component, dict):
+            logger.warning(f"Invalid component format: {component}")
+            return False
+        
+        # Ensure component has required attributes
+        if "type" not in component:
+            component["type"] = "unknown"
+        
+        # Set defaults from library if available
+        if component["type"] in self.component_library:
+            lib_defaults = self.component_library[component["type"]]
+            for key, value in lib_defaults.items():
+                if key not in component:
+                    component[key] = value
+        
+        # Generate reference designator if not present
+        if "reference" not in component:
+            component["reference"] = self._generate_reference(component["type"])
+        
+        # Add component to the list
         self.components.append(component)
+        logger.info(f"Added component: {component['reference']} ({component['type']})")
+        return True
     
     def create_schematic(self):
         """Create a basic schematic based on components and requirements"""
-        # This is a simplified version that just returns component connections
+        if not self.components:
+            return {"connections": []}
+        
         connections = []
         
-        # If we have a microcontroller, connect other components to it
-        mcu_index = -1
-        for i, comp in enumerate(self.components):
-            if comp.get("type") == "microcontroller":
-                mcu_index = i
-                break
+        # Identify power components
+        power_sources = [i for i, comp in enumerate(self.components) 
+                       if comp.get("type") in ["regulator", "battery"]]
         
-        if mcu_index >= 0:
-            # Connect components to MCU pins
-            mcu_pins_used = 0
+        # Identify microcontrollers
+        mcu_indices = [i for i, comp in enumerate(self.components) 
+                      if comp.get("type") == "microcontroller"]
+        
+        # If we have a microcontroller and power source, connect power to MCU
+        if power_sources and mcu_indices:
+            connections.append({
+                "from": {"component": power_sources[0], "pin": 0},  # Power out pin
+                "to": {"component": mcu_indices[0], "pin": 0}       # Power in pin on MCU
+            })
+        
+        # If we have a microcontroller, connect other components to it
+        if mcu_indices:
+            mcu_index = mcu_indices[0]
+            mcu = self.components[mcu_index]
+            mcu_pins_used = 1  # Start at 1 since pin 0 might be used for power
+            
+            # Connect LEDs and other components to MCU
             for i, comp in enumerate(self.components):
-                if i != mcu_index and mcu_pins_used < self.components[mcu_index].get("pins", 32) - 1:
-                    connections.append({
-                        "from": {"component": mcu_index, "pin": mcu_pins_used},
-                        "to": {"component": i, "pin": 0}
-                    })
+                if i != mcu_index and comp.get("type") != "regulator" and mcu_pins_used < mcu.get("pins", 32) - 1:
+                    if comp.get("type") == "LED":
+                        # Find a resistor to use as current limiter for LED
+                        resistors = [j for j, c in enumerate(self.components) if c.get("type") == "resistor"]
+                        if resistors:
+                            # Connect MCU to resistor
+                            connections.append({
+                                "from": {"component": mcu_index, "pin": mcu_pins_used},
+                                "to": {"component": resistors[0], "pin": 0}
+                            })
+                            # Connect resistor to LED
+                            connections.append({
+                                "from": {"component": resistors[0], "pin": 1},
+                                "to": {"component": i, "pin": 0}
+                            })
+                            # Connect LED to ground (assuming pin 1 of LED is ground)
+                            connections.append({
+                                "from": {"component": i, "pin": 1},
+                                "to": {"component": mcu_index, "pin": mcu.get("pins", 32) - 1}  # Last pin as ground
+                            })
+                        else:
+                            # Connect directly to LED if no resistor
+                            connections.append({
+                                "from": {"component": mcu_index, "pin": mcu_pins_used},
+                                "to": {"component": i, "pin": 0}
+                            })
+                    else:
+                        # Connect other components directly
+                        connections.append({
+                            "from": {"component": mcu_index, "pin": mcu_pins_used},
+                            "to": {"component": i, "pin": 0}
+                        })
+                    
                     mcu_pins_used += 1
         else:
             # Simple daisy chain connection if no MCU
@@ -126,243 +475,735 @@ class PCBDesigner:
                     "from": {"component": i, "pin": 1},
                     "to": {"component": i + 1, "pin": 0}
                 })
-                
-        return {"connections": connections}
+        
+        return {
+            "connections": connections,
+            "components": [
+                {
+                    "id": i,
+                    "reference": comp.get("reference", f"U{i}"),
+                    "type": comp.get("type", "unknown"),
+                    "pins": comp.get("pins", 2)
+                } 
+                for i, comp in enumerate(self.components)
+            ]
+        }
     
     def place_components(self):
-        """Place components on the board using a simple grid layout"""
+        """Place components on the board using improved layout algorithms"""
+        if not self.components:
+            return []
+        
         placements = []
         
-        # Simple grid placement
-        grid_size = int(np.ceil(np.sqrt(len(self.components))))
-        cell_width = self.board_params["width"] / grid_size
-        cell_height = self.board_params["height"] / grid_size
+        # Determine actual space needed for components
+        total_components = len(self.components)
+        large_components = sum(1 for comp in self.components if comp.get("pins", 0) > 8)
+        small_components = total_components - large_components
         
-        for i, component in enumerate(self.components):
-            row = i // grid_size
-            col = i % grid_size
+        # Determine placement strategy based on components
+        if large_components > 0:
+            # Place large components (like MCUs) in the center
+            large_indices = [i for i, comp in enumerate(self.components) if comp.get("pins", 0) > 8]
             
-            # Center component in its cell
-            x = col * cell_width + cell_width / 2
-            y = row * cell_height + cell_height / 2
+            # Center placement for large components
+            center_x = self.board_params["width"] / 2
+            center_y = self.board_params["height"] / 2
             
-            # Assign orientation (0, 90, 180, or 270 degrees)
-            orientation = 0  # Default orientation
+            # Place large components in the center
+            for idx, i in enumerate(large_indices):
+                offset = (idx - len(large_indices) / 2) * 20  # Space large components
+                placements.append({
+                    "component": i,
+                    "x": center_x + offset,
+                    "y": center_y,
+                    "orientation": 0
+                })
             
-            placements.append({
-                "component": i,
-                "x": x,
-                "y": y,
-                "orientation": orientation
-            })
+            # Place small components around the large ones
+            small_indices = [i for i in range(total_components) if i not in large_indices]
             
+            # Create a circular placement pattern around center
+            radius = min(self.board_params["width"], self.board_params["height"]) * 0.3
+            for idx, i in enumerate(small_indices):
+                angle = (idx / len(small_indices)) * 2 * np.pi
+                placements.append({
+                    "component": i,
+                    "x": center_x + radius * np.cos(angle),
+                    "y": center_y + radius * np.sin(angle),
+                    "orientation": int(angle * 180 / np.pi) % 360
+                })
+        else:
+            # Grid placement for boards with only small components
+            grid_size = int(np.ceil(np.sqrt(total_components)))
+            cell_width = self.board_params["width"] / (grid_size + 1)  # Leave margin
+            cell_height = self.board_params["height"] / (grid_size + 1)  # Leave margin
+            
+            for i in range(total_components):
+                row = i // grid_size
+                col = i % grid_size
+                
+                # Center component in its cell with margin
+                x = (col + 1) * cell_width
+                y = (row + 1) * cell_height
+                
+                # Randomize orientation slightly for more natural placement
+                orientation = 0
+                
+                placements.append({
+                    "component": i,
+                    "x": x,
+                    "y": y,
+                    "orientation": orientation
+                })
+        
         return placements
     
-    def create_pcb(self):
+    def create_pcb(self, output_dir):
         """Create a PCB layout based on schematic and placement"""
+        if not self.components:
+            logger.warning("No components to place on PCB")
+            return None
+        
+        # Create output directory
+        pcb_dir = Path(output_dir)
+        pcb_dir.mkdir(exist_ok=True, parents=True)
+        
         # Create a new PCB board
         board = pcbnew.BOARD()
         
         # Set board dimensions
-        board_rect = pcbnew.BOX2I(
-            pcbnew.VECTOR2I(0, 0),
-            pcbnew.VECTOR2I(
-                pcbnew.FromMM(self.board_params["width"]),
-                pcbnew.FromMM(self.board_params["height"])
-            )
-        )
-        board.SetBoardEdgesBoundary(board_rect)
+        board_width_iu = pcbnew.FromMM(self.board_params["width"])
+        board_height_iu = pcbnew.FromMM(self.board_params["height"])
+        
+        # Create board outline
+        edge_layer = board.GetLayerID("Edge.Cuts")
+        outline = pcbnew.PCB_SHAPE(board)
+        outline.SetShape(pcbnew.SHAPE_T_RECT)
+        outline.SetLayer(edge_layer)
+        outline.SetStart(pcbnew.VECTOR2I(0, 0))
+        outline.SetEnd(pcbnew.VECTOR2I(board_width_iu, board_height_iu))
+        board.Add(outline)
+        
+        # Set design rules
+        design_settings = board.GetDesignSettings()
+        design_settings.m_TrackMinWidth = pcbnew.FromMM(self.board_params["trace_width"])
+        design_settings.m_ViasMinSize = pcbnew.FromMM(self.board_params["via_size"])
+        design_settings.m_ViasMinDrill = pcbnew.FromMM(self.board_params["via_drill"])
+        
+        # Add netclasses
+        net_info = board.GetNetInfo()
+        default_netclass = net_info.GetNetClass("Default")
+        if default_netclass:
+            default_netclass.SetClearance(pcbnew.FromMM(self.board_params["clearance"]))
+            default_netclass.SetTrackWidth(pcbnew.FromMM(self.board_params["trace_width"]))
+            default_netclass.SetViaDiameter(pcbnew.FromMM(self.board_params["via_size"]))
+            default_netclass.SetViaDrill(pcbnew.FromMM(self.board_params["via_drill"]))
         
         # Add components
         placements = self.place_components()
         footprints = []
         
-        for i, placement in enumerate(placements):
-            component = self.components[i]
+        # Load footprint libraries
+        fp_lib_table = pcbnew.FP_LIB_TABLE()
+        fp_lib_table.Load(fp_lib_table.GetFullDefaultFilename())
+        
+        for placement in placements:
+            component_idx = placement["component"]
+            if component_idx >= len(self.components):
+                logger.warning(f"Invalid component index: {component_idx}")
+                continue
+                
+            component = self.components[component_idx]
             comp_type = component.get("type", "unknown")
             
             if comp_type in self.component_library:
                 footprint_name = self.component_library[comp_type]["footprint"]
-                fp_lib_table = pcbnew.FP_LIB_TABLE()
-                fp_lib_table.Load(fp_lib_table.GetFullDefaultFilename())
-                footprint = pcbnew.FootprintLoad(fp_lib_table, footprint_name)
-                
-                if footprint:
-                    footprint.SetPosition(
-                        pcbnew.VECTOR2I(
-                            pcbnew.FromMM(placement["x"]), 
-                            pcbnew.FromMM(placement["y"])
+                try:
+                    # Try to load footprint
+                    footprint = pcbnew.FootprintLoad(fp_lib_table, footprint_name)
+                    
+                    if footprint:
+                        # Set position and orientation
+                        footprint.SetPosition(
+                            pcbnew.VECTOR2I(
+                                pcbnew.FromMM(placement["x"]), 
+                                pcbnew.FromMM(placement["y"])
+                            )
                         )
-                    )
-                    footprint.SetOrientation(pcbnew.EDA_ANGLE(placement["orientation"], pcbnew.DEGREES_T))
-                    board.Add(footprint)
-                    footprints.append(footprint)
+                        footprint.SetOrientation(pcbnew.EDA_ANGLE(placement["orientation"], pcbnew.DEGREES_T))
+                        
+                        # Set reference
+                        ref = component.get("reference", f"U{component_idx}")
+                        footprint.SetReference(ref)
+                        
+                        # Add to board
+                        board.Add(footprint)
+                        footprints.append(footprint)
+                        logger.info(f"Placed {ref} ({comp_type}) at ({placement['x']}, {placement['y']})")
+                    else:
+                        logger.warning(f"Failed to load footprint: {footprint_name}")
+                except Exception as e:
+                    logger.error(f"Error placing component {component_idx}: {e}")
         
         # Create traces based on schematic
         schematic = self.create_schematic()
+        
+        # First, assign unique net codes
+        net_counter = 1
         for connection in schematic["connections"]:
-            if len(footprints) > connection["from"]["component"] and len(footprints) > connection["to"]["component"]:
-                fp_from = footprints[connection["from"]["component"]]
-                fp_to = footprints[connection["to"]["component"]]
+            net_name = f"Net-{net_counter}"
+            net_code = net_info.GetNetCount() + 1
+            new_net = net_info.Add(net_name)
+            net_counter += 1
+            
+            # Assign net code to pads
+            from_comp_idx = connection["from"]["component"]
+            to_comp_idx = connection["to"]["component"]
+            
+            if from_comp_idx < len(footprints) and to_comp_idx < len(footprints):
+                fp_from = footprints[from_comp_idx]
+                fp_to = footprints[to_comp_idx]
                 
-                # Get pads
-                pad_from = None
-                pad_to = None
-                
-                for pad in fp_from.Pads():
-                    if pad.GetNumber() == str(connection["from"]["pin"] + 1):
-                        pad_from = pad
-                        break
-                
-                for pad in fp_to.Pads():
-                    if pad.GetNumber() == str(connection["to"]["pin"] + 1):
-                        pad_to = pad
-                        break
+                # Find pads by number
+                pad_from = self._find_pad_by_number(fp_from, connection["from"]["pin"] + 1)
+                pad_to = self._find_pad_by_number(fp_to, connection["to"]["pin"] + 1)
                 
                 if pad_from and pad_to:
-                    # Create track
+                    # Assign both pads to the same net
+                    pad_from.SetNet(new_net)
+                    pad_to.SetNet(new_net)
+                    
+                    # Create track to connect pads
                     track = pcbnew.PCB_TRACK(board)
-                    track.SetWidth(pcbnew.FromMM(self.board_params["trace_width"]))
                     track.SetStart(pad_from.GetPosition())
                     track.SetEnd(pad_to.GetPosition())
+                    track.SetWidth(pcbnew.FromMM(self.board_params["trace_width"]))
+                    track.SetLayer(board.GetLayerID("F.Cu"))  # Place on front copper
+                    track.SetNet(new_net)
                     board.Add(track)
+                    
+                    logger.info(f"Created trace from {fp_from.GetReference()}:{connection['from']['pin']} " 
+                               f"to {fp_to.GetReference()}:{connection['to']['pin']}")
+                else:
+                    logger.warning(f"Could not find pads for connection: {connection}")
         
-        # Generate board outline
-        edge_cuts = board.GetLayerID("Edge.Cuts")
-        seg = pcbnew.PCB_SHAPE(board)
-        seg.SetShape(pcbnew.SHAPE_T_RECT)
-        seg.SetLayer(edge_cuts)
-        seg.SetStart(pcbnew.VECTOR2I(0, 0))
-        seg.SetEnd(pcbnew.VECTOR2I(
-            pcbnew.FromMM(self.board_params["width"]),
-            pcbnew.FromMM(self.board_params["height"])
-        ))
-        board.Add(seg)
+        # Generate ground and power planes if it's a multi-layer board
+        if self.board_params["layers"] >= 2:
+            # Add ground plane on bottom layer
+            self._create_ground_plane(board)
         
-        # Save board to temporary file
-        temp_dir = tempfile.mkdtemp()
-        board_file = os.path.join(temp_dir, "board.kicad_pcb")
+        # Save board to file
+        board_file = os.path.join(output_dir, "circuit_iq.kicad_pcb")
         board.Save(board_file)
         
-        # Export to Gerber
-        gerber_dir = os.path.join(temp_dir, "gerber")
+        # Export Gerber files
+        gerber_dir = os.path.join(output_dir, "gerber")
         os.makedirs(gerber_dir, exist_ok=True)
+        self._export_gerbers(board, gerber_dir)
         
-        plot_controller = pcbnew.PLOT_CONTROLLER(board)
-        plot_options = plot_controller.GetPlotOptions()
-        plot_options.SetOutputDirectory(gerber_dir)
+        # Create preview image
+        preview_file = os.path.join(output_dir, "preview.png")
+        self._create_preview(gerber_dir, preview_file)
         
-        # Set gerber options
-        plot_options.SetPlotFrameRef(False)
-        plot_options.SetPlotValue(True)
-        plot_options.SetPlotReference(True)
-        plot_options.SetPlotInvisibleText(False)
-        plot_options.SetExcludeEdgeLayer(False)
-        plot_options.SetMirror(False)
-        plot_options.SetNegative(False)
-        plot_options.SetPlotViaOnMaskLayer(False)
-        plot_options.SetUseGerberProtelExtensions(True)
-        plot_options.SetUseAuxOrigin(False)
-        plot_options.SetSubtractMaskFromSilk(True)
-        plot_options.SetScale(1)
-        plot_options.SetPlotMode(pcbnew.FILLED)
+        results = {
+            "board_file": board_file,
+            "gerber_dir": gerber_dir,
+            "preview_file": preview_file,
+            "components": len(self.components),
+            "traces": len(board.GetTracks()),
+            "dims": f"{self.board_params['width']}mm × {self.board_params['height']}mm"
+        }
         
-        # Plot Gerber layers
-        plot_controller.OpenPlotfile("F_Cu", pcbnew.PLOT_FORMAT_GERBER, "Top Layer")
-        plot_controller.PlotLayer()
-        
-        if self.board_params["layers"] > 1:
-            plot_controller.OpenPlotfile("B_Cu", pcbnew.PLOT_FORMAT_GERBER, "Bottom Layer")
-            plot_controller.PlotLayer()
-        
-        plot_controller.OpenPlotfile("F_Mask", pcbnew.PLOT_FORMAT_GERBER, "Mask Top")
-        plot_controller.PlotLayer()
-        
-        plot_controller.OpenPlotfile("F_SilkS", pcbnew.PLOT_FORMAT_GERBER, "Silk Top")
-        plot_controller.PlotLayer()
-        
-        plot_controller.OpenPlotfile("Edge_Cuts", pcbnew.PLOT_FORMAT_GERBER, "Edges")
-        plot_controller.PlotLayer()
-        
-        plot_controller.ClosePlot()
-        
-        # Create drill file
-        drill_writer = pcbnew.EXCELLON_WRITER(board)
-        drill_writer.SetOptions(
-            False,  # Mirror
-            True,   # Minimal header
-            pcbnew.EXCELLON_WRITER.METRIC,
-            False   # Zeros format
-        )
-        drill_writer.SetFormat(False)
-        drill_writer.CreateDrillandMapFilesSet(gerber_dir, True, False)
-        
-        return {"board_file": board_file, "gerber_dir": gerber_dir}
+        return results
     
-    def generate_gerber_preview(self, gerber_dir):
-        """Generate a preview image of the Gerber files"""
-        # This would normally use the gerber-renderer library to create a PNG
-        # For the MVP, we're just returning a stub
-        return {"preview_url": "/static/preview.png"}
+    def _find_pad_by_number(self, footprint, pad_number):
+        """Find a pad in a footprint by its number"""
+        for pad in footprint.Pads():
+            if pad.GetNumber() == str(pad_number):
+                return pad
+        return None
+    
+    def _create_ground_plane(self, board):
+        """Create a ground plane on the bottom layer"""
+        try:
+            # Get the ground net
+            net_info = board.GetNetInfo()
+            gnd_net = net_info.FindNet("GND")
+            if not gnd_net:
+                gnd_net = net_info.Add("GND")
+            
+            # Add zone container for ground plane
+            zone = pcbnew.ZONE(board)
+            zone.SetLayer(board.GetLayerID("B.Cu"))  # Bottom copper
+            zone.SetNet(gnd_net)
+            zone.SetIslandRemovalMode(pcbnew.ISLAND_REMOVAL_MODE::ISLANDS_DELETE_SMALL)
+            zone.SetMinThickness(pcbnew.FromMM(0.254))  # Minimum copper thickness
+            
+            # Create zone outline (with margin from board edge)
+            margin = pcbnew.FromMM(self.board_params.get("edge_clearance", 1.0))
+            outline = zone.Outline()
+            outline.Append(
+                pcbnew.VECTOR2I(margin, margin)
+            )
+            outline.Append(
+                pcbnew.VECTOR2I(pcbnew.FromMM(self.board_params["width"]) - margin, margin)
+            )
+            outline.Append(
+                pcbnew.VECTOR2I(pcbnew.FromMM(self.board_params["width"]) - margin, 
+                              pcbnew.FromMM(self.board_params["height"]) - margin)
+            )
+            outline.Append(
+                pcbnew.VECTOR2I(margin, pcbnew.FromMM(self.board_params["height"]) - margin)
+            )
+            outline.Append(
+                pcbnew.VECTOR2I(margin, margin)
+            )
+            
+            board.Add(zone)
+            
+            # Fill the zone
+            filler = pcbnew.ZONE_FILLER(board)
+            filler.Fill(board.Zones())
+            
+            logger.info("Added ground plane to bottom layer")
+            
+        except Exception as e:
+            logger.error(f"Failed to create ground plane: {e}")
+    
+    def _export_gerbers(self, board, output_dir):
+        """Export Gerber files for manufacturing"""
+        try:
+            # Create plot controller
+            plot_controller = pcbnew.PLOT_CONTROLLER(board)
+            plot_options = plot_controller.GetPlotOptions()
+            
+            # Set general plot options
+            plot_options.SetOutputDirectory(output_dir)
+            plot_options.SetPlotFrameRef(False)
+            plot_options.SetPlotValue(True)
+            plot_options.SetPlotReference(True)
+            plot_options.SetExcludeEdgeLayer(False)
+            plot_options.SetScale(1)
+            plot_options.SetUseGerberAttributes(True)
+            plot_options.SetIncludeGerberNetlistInfo(True)
+            plot_options.SetCreateGerberJobFile(True)
+            plot_options.SetUseGerberProtelExtensions(False)
+            plot_options.SetUseAuxOrigin(False)
+            plot_options.SetSubtractMaskFromSilk(True)
+            plot_options.SetPlotMode(pcbnew.PLOT_MODE_FILLED)
+            plot_options.SetDrillMarksType(pcbnew.PCB_PLOT_PARAMS.FULL_DRILL_SHAPE)
+            
+            # Plot layers
+            layers_to_plot = [
+                ("F.Cu", pcbnew.F_Cu, "Top layer"),
+                ("B.Cu", pcbnew.B_Cu, "Bottom layer"),
+                ("F.Paste", pcbnew.F_Paste, "Paste top"),
+                ("B.Paste", pcbnew.B_Paste, "Paste bottom"),
+                ("F.SilkS", pcbnew.F_SilkS, "Silk top"),
+                ("B.SilkS", pcbnew.B_SilkS, "Silk bottom"),
+                ("F.Mask", pcbnew.F_Mask, "Mask top"),
+                ("B.Mask", pcbnew.B_Mask, "Mask bottom"),
+                ("Edge.Cuts", pcbnew.Edge_Cuts, "Edges")
+            ]
+            
+            # Only plot needed layers
+            for layer_info in layers_to_plot:
+                layer_name, layer_id, layer_desc = layer_info
+                
+                # Skip bottom layers if single-sided
+                if self.board_params["layers"] == 1 and "B." in layer_name:
+                    continue
+                
+                # Skip silkscreen if not requested
+                if not self.board_params.get("silkscreen", True) and "SilkS" in layer_name:
+                    continue
+                
+                # Skip solder mask if not requested
+                if not self.board_params.get("mask_solder", True) and "Mask" in layer_name:
+                    continue
+                
+                # Create plot file
+                plot_controller.SetLayer(layer_id)
+                plot_controller.OpenPlotfile(layer_name, pcbnew.PLOT_FORMAT_GERBER, layer_desc)
+                plot_controller.PlotLayer()
+                
+            plot_controller.ClosePlot()
+            
+            # Generate drill files
+            drill_writer = pcbnew.EXCELLON_WRITER(board)
+            drill_writer.SetOptions(
+                False,  # Mirror
+                True,   # Minimal header
+                pcbnew.EXCELLON_WRITER.METRIC,
+                False   # No merge PTH/NPTH
+            )
+            drill_writer.SetFormat(False)
+            drill_writer.CreateDrillandMapFilesSet(output_dir, True, True)
+            
+            logger.info(f"Exported Gerber files to {output_dir}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to export Gerber files: {e}")
+            return False
+    
+    def _create_preview(self, gerber_dir, output_file):
+        """Create a preview image of the PCB design"""
+        try:
+            # Use the GerberRenderer from gerber-tools to create preview
+            # This is a simplified version, in real implementation you'd use 
+            # proper Gerber visualization libraries like pcb-tools
+            
+            # Find gerber files
+            copper_file = None
+            for file in os.listdir(gerber_dir):
+                if file.endswith('.gbr') and 'F.Cu' in file:
+                    copper_file = os.path.join(gerber_dir, file)
+                    break
+            
+            if copper_file:
+                # Very simplified preview - in real implementation use proper visualization
+                try:
+                    logger.info(f"Creating preview image at {output_file}")
+                    # In real implementation, you'd use a proper Gerber renderer
+                    # For the MVP, we just create a placeholder image
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    ax.set_aspect('equal')
+                    ax.set_xlim(0, self.board_params["width"])
+                    ax.set_ylim(0, self.board_params["height"])
+                    
+                    # Draw board outline
+                    rect = plt.Rectangle((0, 0), self.board_params["width"], self.board_params["height"], 
+                                       fill=True, color='green', alpha=0.5)
+                    ax.add_patch(rect)
+                    
+                    # Draw component placeholders
+                    placements = self.place_components()
+                    for placement in placements:
+                        comp_idx = placement["component"]
+                        if comp_idx < len(self.components):
+                            component = self.components[comp_idx]
+                            # Determine size based on component type
+                            if component.get("type") == "microcontroller":
+                                width, height = 15, 15
+                            else:
+                                width, height = 3, 2
+                            
+                            # Draw component
+                            rect = plt.Rectangle((placement["x"] - width/2, placement["y"] - height/2), 
+                                              width, height, fill=True, color='black', alpha=0.7)
+                            ax.add_patch(rect)
+                            
+                            # Add reference text
+                            ax.text(placement["x"], placement["y"], component.get("reference", ""), 
+                                  ha='center', va='center', color='white', fontsize=8)
+                    
+                    plt.title('Circuit IQ PCB Preview')
+                    plt.grid(True)
+                    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to create PCB preview: {e}")
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error creating preview: {e}")
+            return False
 
+def analyze_requirements(text):
+    """Analyze text requirements for PCB design needs"""
+    designer = PCBDesigner()
+    parsed = designer.parse_requirements(text)
+    
+    # Add common components based on requirements
+    recommendations = {
+        "recommended_components": []
+    }
+    
+    if parsed["circuit_needs"].get("power_regulation"):
+        recommendations["recommended_components"].append({
+            "type": "regulator",
+            "description": "Voltage regulator for power stabilization"
+        })
+    
+    if parsed["circuit_needs"].get("microcontroller"):
+        recommendations["recommended_components"].append({
+            "type": "microcontroller",
+            "description": "Central processing unit for the circuit"
+        })
+    
+    if parsed["circuit_needs"].get("led_indicators"):
+        recommendations["recommended_components"].append({
+            "type": "LED", 
+            "description": "Visual indicator"
+        })
+        recommendations["recommended_components"].append({
+            "type": "resistor", 
+            "description": "Current limiting resistor for LED"
+        })
+    
+    if parsed["circuit_needs"].get("analog_sensing"):
+        recommendations["recommended_components"].append({
+            "type": "capacitor", 
+            "description": "For signal filtering and stabilization"
+        })
+    
+    # Add connectivity components
+    for conn in parsed.get("connectivity", []):
+        if conn == "bluetooth":
+            recommendations["recommended_components"].append({
+                "type": "bluetooth_module", 
+                "description": "Bluetooth connectivity module"
+            })
+        elif conn == "wifi":
+            recommendations["recommended_components"].append({
+                "type": "wifi_module", 
+                "description": "WiFi connectivity module"
+            })
+    
+    # Add recommended board parameters based on requirements
+    if len(recommendations["recommended_components"]) > 5:
+        # More complex circuit needs larger board
+        recommendations["recommended_board_params"] = {
+            "layers": 2,
+            "width": 100,
+            "height": 80
+        }
+    else:
+        # Simpler circuit can use smaller board
+        recommendations["recommended_board_params"] = {
+            "layers": 2,
+            "width": 70,
+            "height": 50
+        }
+    
+    # Add keyword analysis
+    recommendations["keywords"] = parsed["keywords"][:10]
+    recommendations["circuit_type"] = parsed["circuit_type"]
+    
+    return recommendations
+
+# Flask routes
 @app.route('/')
 def index():
     return render_template('index.html')
 
+@app.route('/api/analyze_requirements', methods=['POST'])
+def api_analyze_requirements():
+    """Analyze text requirements and suggest components and parameters"""
+    data = request.json
+    if not data or 'text' not in data:
+        return jsonify({"status": "error", "message": "No requirements text provided"}), 400
+    
+    try:
+        requirements_text = data['text']
+        analysis = analyze_requirements(requirements_text)
+        return jsonify({"status": "success", "analysis": analysis})
+    except Exception as e:
+        logger.error(f"Error analyzing requirements: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/extract_from_datasheet', methods=['POST'])
+def api_extract_from_datasheet():
+    """Extract component information from a datasheet file or text"""
+    if 'file' in request.files:
+        # Process uploaded file
+        datasheet_file = request.files['file']
+        if not datasheet_file.filename:
+            return jsonify({"status": "error", "message": "No file selected"}), 400
+        
+        # Save to temporary location
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], datasheet_file.filename)
+        datasheet_file.save(file_path)
+        
+        try:
+            # Extract component info
+            designer = PCBDesigner()
+            component = designer.extract_from_datasheet(file_path)
+            
+            # Delete file after processing
+            os.unlink(file_path)
+            
+            return jsonify({
+                "status": "success", 
+                "component": component
+            })
+        except Exception as e:
+            logger.error(f"Error extracting from datasheet file: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    elif request.json and 'text' in request.json:
+        # Process text content
+        try:
+            datasheet_text = request.json['text']
+            designer = PCBDesigner()
+            component = designer.extract_from_datasheet(datasheet_text)
+            return jsonify({
+                "status": "success", 
+                "component": component
+            })
+        except Exception as e:
+            logger.error(f"Error extracting from datasheet text: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    else:
+        return jsonify({"status": "error", "message": "No datasheet provided"}), 400
+
 @app.route('/api/design_pcb', methods=['POST'])
 def design_pcb():
-    data = request.json
-    
-    # Initialize PCB designer
-    designer = PCBDesigner()
-    
-    # Process datasheets
-    datasheets = data.get('datasheets', [])
-    for datasheet in datasheets:
-        datasheet_text = datasheet.get('content', '')
-        component = designer.extract_from_datasheet(datasheet_text)
-        if component.get('type') != 'unknown':
-            designer.add_component(component)
-    
-    # Process requirements
-    requirements = data.get('requirements', '')
-    parsed_requirements = designer.parse_requirements(requirements)
-    
-    # Add required components based on requirements if not already in datasheets
-    circuit_needs = parsed_requirements.get('circuit_needs', {})
-    if circuit_needs.get('power_regulation') and not any(c.get('type') == 'regulator' for c in designer.components):
-        designer.add_component({'type': 'regulator', 'pins': 3})
-    
-    if circuit_needs.get('microcontroller') and not any(c.get('type') == 'microcontroller' for c in designer.components):
-        designer.add_component({'type': 'microcontroller', 'pins': 32})
-    
-    if circuit_needs.get('led_indicators') and not any(c.get('type') == 'LED' for c in designer.components):
-        designer.add_component({'type': 'LED', 'pins': 2})
-        designer.add_component({'type': 'resistor', 'pins': 2})  # Current limiting resistor
-    
-    # Set board parameters
-    designer.set_board_parameters(data.get('board_params', {}))
-    
-    # Generate PCB design
+    """Generate PCB design from components and parameters"""
     try:
-        pcb_result = designer.create_pcb()
-        preview = designer.generate_gerber_preview(pcb_result['gerber_dir'])
+        data = request.json
+        if not data:
+            return jsonify({"status": "error", "message": "No data provided"}), 400
         
-        # Return results
+        # Initialize PCB designer
+        designer = PCBDesigner()
+        
+        # Set board parameters
+        board_params = data.get('board_params', {})
+        designer.set_board_parameters(board_params)
+        
+        # Process components
+        components = data.get('components', [])
+        if not components:
+            # Process datasheets if no components provided
+            datasheets = data.get('datasheets', [])
+            for datasheet in datasheets:
+                datasheet_text = datasheet.get('content', '')
+                component = designer.extract_from_datasheet(datasheet_text)
+                if component.get('type') != 'unknown':
+                    designer.add_component(component)
+            
+            # Process requirements
+            requirements = data.get('requirements', '')
+            if requirements:
+                parsed_requirements = designer.parse_requirements(requirements)
+                
+                # Add required components based on requirements if not already in datasheets
+                circuit_needs = parsed_requirements.get('circuit_needs', {})
+                if circuit_needs.get('power_regulation') and not any(c.get('type') == 'regulator' for c in designer.components):
+                    designer.add_component({'type': 'regulator', 'pins': 3})
+                
+                if circuit_needs.get('microcontroller') and not any(c.get('type') == 'microcontroller' for c in designer.components):
+                    designer.add_component({'type': 'microcontroller', 'pins': 32})
+                
+                if circuit_needs.get('led_indicators') and not any(c.get('type') == 'LED' for c in designer.components):
+                    designer.add_component({'type': 'LED', 'pins': 2})
+                    designer.add_component({'type': 'resistor', 'pins': 2})  # Current limiting resistor
+        else:
+            # Add pre-defined components
+            for component in components:
+                designer.add_component(component)
+        
+        # Verify we have components to place
+        if not designer.components:
+            return jsonify({
+                "status": "error", 
+                "message": "No components to place on PCB"
+            }), 400
+        
+        # Create results directory with a unique ID
+        result_id = f"pcb_{int(time.time())}"
+        result_dir = os.path.join(app.config['RESULTS_FOLDER'], result_id)
+        os.makedirs(result_dir, exist_ok=True)
+        
+        # Generate PCB design
+        pcb_result = designer.create_pcb(result_dir)
+        
+        if not pcb_result:
+            return jsonify({
+                "status": "error", 
+                "message": "Failed to generate PCB design"
+            }), 500
+        
+        # Generate relative URLs
+        preview_url = f"/results/{result_id}/preview.png"
+        gerber_files = []
+        
+        # List Gerber files
+        gerber_dir = os.path.join(result_dir, "gerber")
+        if os.path.exists(gerber_dir):
+            for f in os.listdir(gerber_dir):
+                if f.endswith(('.gbr', '.drl')):
+                    gerber_files.append({
+                        'name': f, 
+                        'url': f'/results/{result_id}/gerber/{f}'
+                    })
+        
+        # Return success response
         return jsonify({
-            'status': 'success',
-            'preview_url': preview['preview_url'],
-            'gerber_files': [
-                {'name': f, 'url': f'/download/{f}'} 
-                for f in os.listdir(pcb_result['gerber_dir']) 
-                if f.endswith(('.gbr', '.drl'))
-            ]
+            "status": "success",
+            "design_id": result_id,
+            "preview_url": preview_url,
+            "components": len(designer.components),
+            "board_dimensions": f"{designer.board_params['width']}mm × {designer.board_params['height']}mm",
+            "layers": designer.board_params['layers'],
+            "gerber_files": gerber_files
         })
+    
     except Exception as e:
+        logger.error(f"Error generating PCB design: {e}", exc_info=True)
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            "status": "error",
+            "message": f"Failed to generate PCB: {str(e)}"
+        }), 500
+
+@app.route('/results/<design_id>/<path:filename>')
+def serve_result_file(design_id, filename):
+    """Serve files from the results directory"""
+    result_dir = os.path.join(app.config['RESULTS_FOLDER'], design_id)
+    if not os.path.exists(result_dir):
+        abort(404)
+    
+    # Handle gerber subdirectory
+    if filename.startswith('gerber/'):
+        # Strip 'gerber/' prefix and serve from gerber subdirectory
+        gerber_filename = filename.split('/', 1)[1]
+        return send_from_directory(os.path.join(result_dir, 'gerber'), gerber_filename)
+    
+    # Serve file from result directory
+    return send_from_directory(result_dir, filename)
+
+# API endpoint to get available component types
+@app.route('/api/component_types', methods=['GET'])
+def get_component_types():
+    """Return a list of available component types"""
+    designer = PCBDesigner()
+    component_types = []
+    
+    for comp_type, details in designer.component_library.items():
+        component_types.append({
+            "type": comp_type,
+            "description": details.get("description", ""),
+            "pins": details.get("pins", 0)
         })
+    
+    return jsonify({
+        "status": "success",
+        "component_types": component_types
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "service": "Circuit IQ API",
+        "timestamp": int(time.time())
+    })
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Default port as 5000
+    port = int(os.environ.get('PORT', 5000))
+    
+    # In production, use a WSGI server like Gunicorn
+    if os.environ.get('FLASK_ENV') == 'production':
+        # Use production server
+        app.run(host='0.0.0.0', port=port)
+    else:
+        # Use development server
+        app.run(debug=True, host='0.0.0.0', port=port)
