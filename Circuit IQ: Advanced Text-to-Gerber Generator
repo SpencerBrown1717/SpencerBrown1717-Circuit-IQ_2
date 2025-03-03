@@ -1,0 +1,2052 @@
+import os
+import math
+import re
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Any, Optional, Union, Set
+from enum import Enum, auto
+import hashlib
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("CircuitIQ")
+
+
+class GerberUnit(Enum):
+    """Units for Gerber files"""
+    MM = auto()    # Millimeters
+    INCH = auto()  # Inches
+
+
+class GerberPolarityType(Enum):
+    """Polarity types for Gerber files"""
+    DARK = auto()  # Dark polarity (default)
+    CLEAR = auto() # Clear polarity
+
+
+class DrillUnit(Enum):
+    """Units for drill files"""
+    MM = auto()    # Millimeters
+    INCH = auto()  # Inches
+
+
+@dataclass
+class Point:
+    """Represents a 2D point."""
+    x: float
+    y: float
+    
+    def __add__(self, other: 'Point') -> 'Point':
+        return Point(self.x + other.x, self.y + other.y)
+    
+    def __sub__(self, other: 'Point') -> 'Point':
+        return Point(self.x - other.x, self.y - other.y)
+    
+    def rotate(self, angle_deg: float, origin: Optional['Point'] = None) -> 'Point':
+        """Rotate point around origin by angle in degrees."""
+        if origin is None:
+            origin = Point(0, 0)
+        
+        angle_rad = math.radians(angle_deg)
+        s, c = math.sin(angle_rad), math.cos(angle_rad)
+        
+        # Translate to origin
+        translated = Point(self.x - origin.x, self.y - origin.y)
+        
+        # Rotate
+        rotated_x = translated.x * c - translated.y * s
+        rotated_y = translated.x * s + translated.y * c
+        
+        # Translate back
+        return Point(rotated_x + origin.x, rotated_y + origin.y)
+    
+    def as_tuple(self) -> Tuple[float, float]:
+        return (self.x, self.y)
+    
+    def distance_to(self, other: 'Point') -> float:
+        """Calculate Euclidean distance to another point."""
+        dx = self.x - other.x
+        dy = self.y - other.y
+        return math.sqrt(dx*dx + dy*dy)
+
+
+@dataclass
+class Pin:
+    """Represents a component pin."""
+    id: int
+    name: Optional[str] = None
+    position: Point = field(default_factory=lambda: Point(0, 0))
+    pad_diameter: float = 1.0
+    drill_diameter: float = 0.8
+    is_smd: bool = False
+    net_name: Optional[str] = None
+    
+    def __hash__(self):
+        return hash((self.id, self.name))
+
+
+@dataclass
+class Component:
+    """Represents a PCB component with all its properties."""
+    id: int
+    type: str
+    reference: str
+    value: Optional[str] = None
+    package: Optional[str] = None
+    width: float = 0.0
+    height: float = 0.0
+    rotation: float = 0.0
+    position: Point = field(default_factory=lambda: Point(0, 0))
+    pins: List[Pin] = field(default_factory=list)
+    is_smd: bool = False
+    layer: int = 1  # 1 = top, 2 = bottom
+    
+    @property
+    def pin_count(self) -> int:
+        return len(self.pins)
+    
+    @staticmethod
+    def from_dict(comp_id: int, data: Dict[str, Any]) -> 'Component':
+        """Create a Component from a dictionary."""
+        comp_type = data.get("type", "unknown").lower()
+        reference = data.get("reference", f"{comp_type[0].upper()}{comp_id+1}")
+        
+        # Create component with basic info
+        comp = Component(
+            id=comp_id,
+            type=comp_type,
+            reference=reference,
+            value=data.get("value"),
+            package=data.get("package"),
+            is_smd=data.get("is_smd", False),
+            rotation=data.get("rotation", 0.0),
+            layer=data.get("layer", 1)
+        )
+        
+        # Set default dimensions based on component type and package
+        comp._set_default_dimensions()
+        
+        # Set position if provided
+        if "position" in data:
+            pos = data["position"]
+            comp.position = Point(pos.get("x", 0), pos.get("y", 0))
+        
+        # Create pins
+        pin_count = data.get("pins", 2)
+        pin_names = data.get("pin_names", [])
+        
+        for i in range(pin_count):
+            pin_name = pin_names[i] if i < len(pin_names) else None
+            comp.pins.append(Pin(
+                id=i,
+                name=pin_name,
+                is_smd=comp.is_smd
+            ))
+        
+        # Calculate pin positions
+        comp._calculate_pin_positions()
+        
+        return comp
+    
+    def _set_default_dimensions(self) -> None:
+        """Set default dimensions based on component type and package."""
+        # First, try to set dimensions based on package
+        if self.package:
+            self._set_dimensions_from_package()
+        else:
+            # If no package specified, use component type
+            self._set_dimensions_from_type()
+    
+    def _set_dimensions_from_package(self) -> None:
+        """Set dimensions based on component package."""
+        package = self.package.upper()
+        
+        # DIP packages
+        if package.startswith("DIP"):
+            pin_count = int(re.search(r'\d+', package).group()) if re.search(r'\d+', package) else 8
+            self.width = 7.62  # Standard DIP width
+            self.height = 2.54 * (pin_count // 2)
+            self.is_smd = False
+            
+        # SOIC packages
+        elif package.startswith("SOIC"):
+            pin_count = int(re.search(r'\d+', package).group()) if re.search(r'\d+', package) else 8
+            self.width = 3.9
+            self.height = 1.27 * (pin_count // 2)
+            self.is_smd = True
+            
+        # QFP packages
+        elif any(package.startswith(prefix) for prefix in ["QFP", "TQFP", "LQFP"]):
+            pin_count = int(re.search(r'\d+', package).group()) if re.search(r'\d+', package) else 32
+            pins_per_side = pin_count // 4
+            # Common package sizes
+            if pin_count <= 32:
+                self.width = self.height = 7.0
+            elif pin_count <= 64:
+                self.width = self.height = 10.0
+            elif pin_count <= 100:
+                self.width = self.height = 14.0
+            else:
+                self.width = self.height = 20.0
+            self.is_smd = True
+            
+        # Standard resistor packages
+        elif package in ["0805", "0603", "1206"]:
+            sizes = {
+                "0603": (1.6, 0.8),  # L x W in mm
+                "0805": (2.0, 1.25), 
+                "1206": (3.2, 1.6)
+            }
+            self.width, self.height = sizes.get(package, (2.0, 1.25))
+            self.is_smd = True
+            
+        # TO packages (transistors)
+        elif package.startswith("TO"):
+            package_num = re.search(r'\d+', package).group() if re.search(r'\d+', package) else "220"
+            sizes = {
+                "92": (2.9, 1.3),    # TO-92
+                "220": (10.0, 4.5),  # TO-220
+                "263": (10.0, 8.0)   # TO-263
+            }
+            self.width, self.height = sizes.get(package_num, (10.0, 4.5))
+            self.is_smd = False
+            
+        else:
+            # Unknown package, use component type-based dimensions
+            self._set_dimensions_from_type()
+    
+    def _set_dimensions_from_type(self) -> None:
+        """Set default dimensions based on component type."""
+        comp_type = self.type.lower()
+        
+        if comp_type == "resistor":
+            self.width = 8
+            self.height = 3
+        elif comp_type == "capacitor":
+            if self.pin_count > 2:  # Electrolytic or multi-terminal
+                self.width = self.height = 6
+            else:  # Standard 2-terminal
+                self.width = 6
+                self.height = 3
+        elif comp_type == "led":
+            self.width = 5
+            self.height = 5
+        elif comp_type == "diode":
+            self.width = 6
+            self.height = 3
+        elif comp_type == "transistor":
+            self.width = 7
+            self.height = 7
+        elif comp_type in ["microcontroller", "mcu", "processor", "cpu"]:
+            # Scale by pin count
+            pins_per_side = math.ceil(self.pin_count / 4) if self.pin_count >= 4 else 1
+            self.width = self.height = max(10, pins_per_side * 2.5)
+        elif comp_type in ["ic", "chip", "integrated circuit"]:
+            pins_per_side = math.ceil(self.pin_count / 4) if self.pin_count >= 4 else 1
+            self.width = max(10, pins_per_side * 2)
+            self.height = max(10, pins_per_side * 2)
+        elif comp_type == "connector":
+            if self.pin_count > 4:
+                # Connectors typically have pins in a row
+                self.width = 8
+                self.height = 4 + (self.pin_count * 0.8)
+            else:
+                self.width = 10
+                self.height = 8
+        elif comp_type == "crystal" or comp_type == "oscillator":
+            self.width = 6
+            self.height = 6
+        elif comp_type == "inductor" or comp_type == "coil":
+            self.width = 6
+            self.height = 6
+        elif comp_type == "switch":
+            self.width = 8
+            self.height = 8
+        elif comp_type == "relay":
+            self.width = 15
+            self.height = 10
+        elif comp_type == "fuse":
+            self.width = 10
+            self.height = 4
+        elif comp_type in ["voltage regulator", "regulator"]:
+            self.width = 10
+            self.height = 7
+        else:
+            # Default dimensions for unknown component types
+            self.width = 10
+            self.height = 5
+    
+    def _calculate_pin_positions(self) -> None:
+        """Calculate positions of pins based on component dimensions, type, and package."""
+        comp_center = self.position
+        
+        # Different pin layouts based on component type and pin count
+        if self.pin_count == 2:
+            # Two-pin components (resistors, diodes, capacitors, etc.)
+            pin_distance = self.width * 0.8
+            
+            # Create pin positions
+            self.pins[0].position = Point(comp_center.x - pin_distance/2, comp_center.y)
+            self.pins[1].position = Point(comp_center.x + pin_distance/2, comp_center.y)
+            
+        elif self.pin_count <= 4:
+            # 3 or 4 pin components (transistors, some ICs)
+            # Place pins in a rectangle
+            
+            if self.type.lower() == "transistor" and self.pin_count == 3:
+                # Special case for 3-pin transistors
+                self.pins[0].position = Point(comp_center.x - self.width/4, comp_center.y - self.height/2)  # Base
+                self.pins[1].position = Point(comp_center.x + self.width/4, comp_center.y - self.height/2)  # Collector
+                self.pins[2].position = Point(comp_center.x, comp_center.y + self.height/2)                # Emitter
+            else:
+                # Corners of the rectangle
+                corners = [
+                    Point(comp_center.x - self.width/2, comp_center.y - self.height/2),  # Top-left
+                    Point(comp_center.x + self.width/2, comp_center.y - self.height/2),  # Top-right
+                    Point(comp_center.x + self.width/2, comp_center.y + self.height/2),  # Bottom-right
+                    Point(comp_center.x - self.width/2, comp_center.y + self.height/2)   # Bottom-left
+                ]
+                
+                # Assign corners to pins
+                for i, pin in enumerate(self.pins):
+                    if i < len(corners):
+                        pin.position = corners[i]
+                    
+        else:
+            # Components with more pins (ICs, MCUs, connectors, etc.)
+            
+            # Check if this is a standard DIP/SOIC/QFP package
+            if self.package and (self.package.upper().startswith(('DIP', 'SOIC', 'QFP', 'TQFP', 'LQFP'))):
+                self._calculate_ic_package_pins()
+            else:
+                # Distribute pins around the perimeter of the component
+                self._distribute_pins_on_perimeter()
+        
+        # Apply rotation to all pin positions
+        if self.rotation != 0:
+            for pin in self.pins:
+                pin.position = pin.position.rotate(self.rotation, self.position)
+    
+    def _calculate_ic_package_pins(self) -> None:
+        """Calculate pin positions for standard IC packages (DIP, SOIC, QFP)."""
+        package = self.package.upper()
+        comp_center = self.position
+        
+        if package.startswith(('DIP', 'SOIC')):
+            # Dual In-line packages have pins on two sides
+            pins_per_side = self.pin_count // 2
+            
+            pin_pitch = self.height / (pins_per_side - 0.5)  # Space between pins
+            
+            # Left side pins (from bottom to top)
+            for i in range(pins_per_side):
+                y_pos = comp_center.y + self.height/2 - i * pin_pitch
+                self.pins[i].position = Point(comp_center.x - self.width/2, y_pos)
+            
+            # Right side pins (from top to bottom)
+            for i in range(pins_per_side):
+                y_pos = comp_center.y - self.height/2 + i * pin_pitch
+                self.pins[i + pins_per_side].position = Point(comp_center.x + self.width/2, y_pos)
+                
+        elif any(package.startswith(prefix) for prefix in ['QFP', 'TQFP', 'LQFP']):
+            # Quad packages have pins on four sides
+            pins_per_side = self.pin_count // 4
+            extra_pins = self.pin_count % 4
+            
+            pin_pitch = self.width / (pins_per_side + 0.5)  # Space between pins
+            
+            pin_index = 0
+            sides = ['bottom', 'right', 'top', 'left']
+            
+            for side_idx, side in enumerate(sides):
+                # Add extra pins to sides if needed
+                side_pins = pins_per_side + (1 if side_idx < extra_pins else 0)
+                
+                for i in range(side_pins):
+                    if side == 'bottom':
+                        # Bottom edge, left to right
+                        x_pos = comp_center.x - self.width/2 + i * pin_pitch
+                        y_pos = comp_center.y + self.height/2
+                    elif side == 'right':
+                        # Right edge, bottom to top
+                        x_pos = comp_center.x + self.width/2
+                        y_pos = comp_center.y + self.height/2 - i * pin_pitch
+                    elif side == 'top':
+                        # Top edge, right to left
+                        x_pos = comp_center.x + self.width/2 - i * pin_pitch
+                        y_pos = comp_center.y - self.height/2
+                    else:  # side == 'left'
+                        # Left edge, top to bottom
+                        x_pos = comp_center.x - self.width/2
+                        y_pos = comp_center.y - self.height/2 + i * pin_pitch
+                    
+                    if pin_index < len(self.pins):
+                        self.pins[pin_index].position = Point(x_pos, y_pos)
+                        pin_index += 1
+    
+    def _distribute_pins_on_perimeter(self) -> None:
+        """Distribute pins evenly around the perimeter of the component."""
+        comp_center = self.position
+        
+        # For connectors, often pins are in a single or double row
+        if self.type.lower() == "connector":
+            if self.pin_count <= 16:  # Single row
+                start_x = comp_center.x - self.width/2 + self.width/self.pin_count/2
+                for i, pin in enumerate(self.pins):
+                    x_pos = start_x + i * (self.width / self.pin_count)
+                    pin.position = Point(x_pos, comp_center.y + self.height/2)
+            else:  # Double row
+                pins_per_row = self.pin_count // 2
+                start_x = comp_center.x - self.width/2 + self.width/pins_per_row/2
+                for i, pin in enumerate(self.pins):
+                    row = i // pins_per_row
+                    col = i % pins_per_row
+                    x_pos = start_x + col * (self.width / pins_per_row)
+                    y_pos = comp_center.y + self.height/2 - row * (self.height * 0.6)
+                    pin.position = Point(x_pos, y_pos)
+            return
+        
+        # For other components, distribute pins around the perimeter
+        # Calculate perimeter of the component
+        perimeter = 2 * (self.width + self.height)
+        pin_spacing = perimeter / self.pin_count
+        
+        for i, pin in enumerate(self.pins):
+            # Calculate position along the perimeter
+            distance = i * pin_spacing
+            
+            # Determine which side of the rectangle
+            if distance < self.width:
+                # Bottom edge, left to right
+                x_pos = comp_center.x - self.width/2 + distance
+                y_pos = comp_center.y + self.height/2
+            elif distance < self.width + self.height:
+                # Right edge, bottom to top
+                x_pos = comp_center.x + self.width/2
+                y_pos = comp_center.y + self.height/2 - (distance - self.width)
+            elif distance < 2 * self.width + self.height:
+                # Top edge, right to left
+                x_pos = comp_center.x + self.width/2 - (distance - (self.width + self.height))
+                y_pos = comp_center.y - self.height/2
+            else:
+                # Left edge, top to bottom
+                x_pos = comp_center.x - self.width/2
+                y_pos = comp_center.y - self.height/2 + (distance - (2 * self.width + self.height))
+            
+            pin.position = Point(x_pos, y_pos)
+
+
+@dataclass
+class Net:
+    """Represents a net (electrical connection) in the PCB."""
+    id: int
+    name: str
+    pins: List[Tuple[Component, Pin]] = field(default_factory=list)
+    width: float = 0.25  # Trace width in mm
+    
+    @property
+    def pin_count(self) -> int:
+        return len(self.pins)
+
+    
+@dataclass
+class BoardParameters:
+    """Represents PCB board parameters."""
+    width: float
+    height: float
+    layers: int = 2
+    trace_width: float = 0.25
+    clearance: float = 0.25
+    edge_clearance: float = 1.0
+    board_outline_width: float = 0.1
+    hole_to_hole_spacing: float = 0.5
+    via_drill_size: float = 0.4
+    via_annular_ring: float = 0.2
+    min_track_width: float = 0.2
+    min_track_spacing: float = 0.2
+    copper_weight: float = 1.0  # oz/ft²
+    soldermask_color: str = "green"
+    silkscreen_color: str = "white"
+    plated_holes: bool = True
+    mounting_holes: bool = True
+    mounting_hole_diameter: float = 3.2
+    mounting_hole_inset: float = 5.0
+    grid_size: float = 0.5  # Grid size for component placement in mm
+
+
+class NetBuilder:
+    """
+    Builds nets from component connections.
+    """
+    
+    def __init__(self, components: List[Component]):
+        self.components = {comp.id: comp for comp in components}
+        self.nets: List[Net] = []
+        self.net_names = set()
+    
+    def add_connection(self, from_comp_id: int, from_pin_id: int, 
+                       to_comp_id: int, to_pin_id: int, 
+                       net_name: Optional[str] = None) -> None:
+        """
+        Add a connection between two component pins.
+        
+        Args:
+            from_comp_id: ID of the source component
+            from_pin_id: Pin ID on the source component
+            to_comp_id: ID of the target component
+            to_pin_id: Pin ID on the target component
+            net_name: Optional name for the net
+        """
+        # Check if components and pins exist
+        if from_comp_id not in self.components or to_comp_id not in self.components:
+            logger.warning(f"Cannot add connection: component {from_comp_id} or {to_comp_id} not found")
+            return
+        
+        from_comp = self.components[from_comp_id]
+        to_comp = self.components[to_comp_id]
+        
+        if from_pin_id >= len(from_comp.pins) or to_pin_id >= len(to_comp.pins):
+            logger.warning(f"Cannot add connection: pin {from_pin_id} or {to_pin_id} not found")
+            return
+        
+        from_pin = from_comp.pins[from_pin_id]
+        to_pin = to_comp.pins[to_pin_id]
+        
+        # Generate net name if not provided
+        if not net_name:
+            net_name = f"Net-{from_comp.reference}-{from_pin_id}-{to_comp.reference}-{to_pin_id}"
+        
+        # Ensure unique net name
+        if net_name in self.net_names:
+            base_name = net_name
+            i = 1
+            while net_name in self.net_names:
+                net_name = f"{base_name}_{i}"
+                i += 1
+        
+        self.net_names.add(net_name)
+        
+        # Check if either pin is already in a net
+        for net in self.nets:
+            for comp, pin in net.pins:
+                if (comp.id == from_comp_id and pin.id == from_pin_id) or \
+                   (comp.id == to_comp_id and pin.id == to_pin_id):
+                    # Add the other pin to this net
+                    if (comp.id == from_comp_id and pin.id == from_pin_id):
+                        net.pins.append((to_comp, to_pin))
+                        to_pin.net_name = net.name
+                    else:
+                        net.pins.append((from_comp, from_pin))
+                        from_pin.net_name = net.name
+                    return
+        
+        # If we get here, neither pin is in a net, so create a new one
+        net = Net(id=len(self.nets), name=net_name)
+        net.pins.append((from_comp, from_pin))
+        net.pins.append((to_comp, to_pin))
+        from_pin.net_name = net.name
+        to_pin.net_name = net.name
+        
+        self.nets.append(net)
+    
+    def build_from_connections(self, connections: List[Dict[str, Any]]) -> List[Net]:
+        """
+        Build nets from a list of connection dictionaries.
+        
+        Args:
+            connections: List of connection dictionaries
+            
+        Returns:
+            List of created nets
+        """
+        for conn in connections:
+            from_data = conn.get("from", {})
+            to_data = conn.get("to", {})
+            
+            from_comp = from_data.get("component", 0)
+            from_pin = from_data.get("pin", 0)
+            to_comp = to_data.get("component", 0)
+            to_pin = to_data.get("pin", 0)
+            net_name = conn.get("net_name")
+            
+            self.add_connection(from_comp, from_pin, to_comp, to_pin, net_name)
+        
+        return self.nets
+
+
+class AutoRouter:
+    """
+    Simple auto-router for PCB traces.
+    """
+    
+    def __init__(self, board_params: BoardParameters):
+        self.board_params = board_params
+        self.grid_size = board_params.grid_size
+        self.collision_grid = {}  # Grid for collision detection
+        self.routed_paths = []
+    
+    def add_obstacle(self, x: float, y: float, radius: float) -> None:
+        """
+        Add an obstacle to the collision grid.
+        
+        Args:
+            x, y: Coordinates of the obstacle
+            radius: Radius of the obstacle
+        """
+        grid_x = int(x / self.grid_size)
+        grid_y = int(y / self.grid_size)
+        grid_radius = int(radius / self.grid_size) + 1
+        
+        for dx in range(-grid_radius, grid_radius + 1):
+            for dy in range(-grid_radius, grid_radius + 1):
+                if dx*dx + dy*dy <= grid_radius*grid_radius:
+                    self.collision_grid[(grid_x + dx, grid_y + dy)] = True
+    
+    def is_path_clear(self, start: Point, end: Point) -> bool:
+        """
+        Check if a straight path between two points is clear.
+        
+        Args:
+            start: Start point
+            end: End point
+            
+        Returns:
+            True if path is clear, False otherwise
+        """
+        distance = start.distance_to(end)
+        steps = max(1, int(distance / (self.grid_size / 2)))
+        
+        for i in range(steps + 1):
+            t = i / steps
+            x = start.x + t * (end.x - start.x)
+            y = start.y + t * (end.y - start.y)
+            
+            grid_x = int(x / self.grid_size)
+            grid_y = int(y / self.grid_size)
+            
+            if (grid_x, grid_y) in self.collision_grid:
+                return False
+        
+        return True
+    
+    def route_net(self, net: Net) -> List[List[Point]]:
+        """
+        Route a net using a simple algorithm.
+        
+        Args:
+            net: Net to route
+            
+        Returns:
+            List of paths (each path is a list of points)
+        """
+        if len(net.pins) < 2:
+            return []
+        
+        paths = []
+        
+        # For simplicity, we'll use a star routing approach (all pins connected to the first pin)
+        first_comp, first_pin = net.pins[0]
+        first_point = first_pin.position
+        
+        for comp, pin in net.pins[1:]:
+            target_point = pin.position
+            
+            # Try to route directly if possible
+            if self.is_path_clear(first_point, target_point):
+                paths.append([first_point, target_point])
+                continue
+            
+            # If direct route not possible, try two-segment Manhattan route
+            mid_point1 = Point(first_point.x, target_point.y)
+            mid_point2 = Point(target_point.x, first_point.y)
+            
+            if self.is_path_clear(first_point, mid_point1) and self.is_path_clear(mid_point1, target_point):
+                paths.append([first_point, mid_point1, target_point])
+            elif self.is_path_clear(first_point, mid_point2) and self.is_path_clear(mid_point2, target_point):
+                paths.append([first_point, mid_point2, target_point])
+            else:
+                # If neither direct nor Manhattan routing works, use a zigzag approach
+                mid_x = (first_point.x + target_point.x) / 2
+                mid_y = (first_point.y + target_point.y) / 2
+                
+                mid_point = Point(mid_x, mid_y)
+                
+                zigzag_points = [
+                    first_point,
+                    Point(first_point.x, mid_y),
+                    Point(mid_x, mid_y),
+                    Point(target_point.x, mid_y),
+                    target_point
+                ]
+                
+                # Check if zigzag path is clear
+                path_clear = True
+                for i in range(len(zigzag_points) - 1):
+                    if not self.is_path_clear(zigzag_points[i], zigzag_points[i+1]):
+                        path_clear = False
+                        break
+                
+                if path_clear:
+                    paths.append(zigzag_points)
+                else:
+                    # If all else fails, connect directly anyway
+                    paths.append([first_point, target_point])
+        
+        return paths
+    
+    def route_nets(self, nets: List[Net]) -> Dict[str, List[List[Point]]]:
+        """
+        Route all nets.
+        
+        Args:
+            nets: List of nets to route
+            
+        Returns:
+            Dictionary mapping net names to lists of paths
+        """
+        # Sort nets by the distance of their endpoints (shorter nets first)
+        sorted_nets = sorted(nets, key=lambda net: sum(
+            comp1.position.distance_to(comp2.position) 
+            for i, (comp1, _) in enumerate(net.pins) 
+            for comp2, _ in net.pins[i+1:]) if len(net.pins) >= 2 else 0
+        )
+        
+        routed_nets = {}
+        
+        # Add all components as obstacles
+        for net in nets:
+            for comp, pin in net.pins:
+                # Add pin positions as obstacles
+                self.add_obstacle(pin.position.x, pin.position.y, pin.pad_diameter / 2)
+        
+        # Route each net
+        for net in sorted_nets:
+            paths = self.route_net(net)
+            
+            # Add paths to routed nets
+            routed_nets[net.name] = paths
+            
+            # Add routed paths as obstacles for future nets
+            for path in paths:
+                for i in range(len(path) - 1):
+                    # Add path segments as obstacles
+                    start, end = path[i], path[i+1]
+                    
+                    # Calculate number of points to add as obstacles
+                    distance = start.distance_to(end)
+                    points = max(2, int(distance / self.grid_size))
+                    
+                    for j in range(points):
+                        t = j / (points - 1)
+                        x = start.x + t * (end.x - start.x)
+                        y = start.y + t * (end.y - start.y)
+                        
+                        # Add point as obstacle
+                        self.add_obstacle(x, y, self.board_params.clearance)
+        
+        return routed_nets
+
+
+class AdvancedGerber:
+    """
+    Advanced Gerber file generator with support for all PCB layers.
+    """
+    
+    def __init__(self, units: GerberUnit = GerberUnit.MM):
+        self.units = units
+        self.apertures = {}
+        self.next_aperture_id = 10
+        self.current_aperture = None
+        self.commands = []
+        self.macros = {}
+        self.next_macro_id = 1
+    
+    def _format_coord(self, value: float) -> str:
+        """Format a coordinate value to Gerber format."""
+        if self.units == GerberUnit.MM:
+            # 6 decimal places for mm (1nm resolution)
+            value_int = int(value * 1000000)
+            return f"{value_int:010d}"
+        else:
+            # 6 decimal places for inches (0.1µin resolution)
+            value_int = int(value * 1000000)
+            return f"{value_int:09d}"
+    
+    def begin_file(self, polarity: GerberPolarityType = GerberPolarityType.DARK):
+        """Initialize a new Gerber file."""
+        self.commands = []
+        self.apertures = {}
+        self.current_aperture = None
+        
+        # Add Gerber file header
+        self.commands.extend([
+            "%FSLAX66Y66*%",  # Format specification: Leading zeros omitted, Absolute coords, 6.6 format
+            f"%MO{self.units.name}*%",  # Units: MM or INCH
+            "%TF.GenerationSoftware,CircuitIQ,1.0*%",  # Generation software
+            f"%TF.CreationDate,{self._get_date_string()}*%",  # Creation date
+            f"%LP{polarity.name[0]}*%"  # Layer Polarity: Dark or Clear
+        ])
+    
+    def _get_date_string(self) -> str:
+        """Get current date in Gerber format (YYYYMMDD)."""
+        from datetime import datetime
+        return datetime.now().strftime("%Y%m%d")
+    
+    def add_circle_aperture(self, diameter: float) -> int:
+        """
+        Define a circle aperture and return its ID.
+        
+        Args:
+            diameter: Aperture diameter in current units
+            
+        Returns:
+            Aperture ID
+        """
+        aperture_id = self.next_aperture_id
+        self.next_aperture_id += 1
+        
+        self.apertures[aperture_id] = f"%ADD{aperture_id}C,{diameter:.6f}*%"
+        self.commands.append(self.apertures[aperture_id])
+        
+        return aperture_id
+    
+    def add_rectangle_aperture(self, width: float, height: float) -> int:
+        """
+        Define a rectangle aperture and return its ID.
+        
+        Args:
+            width: Rectangle width in current units
+            height: Rectangle height in current units
+            
+        Returns:
+            Aperture ID
+        """
+        aperture_id = self.next_aperture_id
+        self.next_aperture_id += 1
+        
+        self.apertures[aperture_id] = f"%ADD{aperture_id}R,{width:.6f}X{height:.6f}*%"
+        self.commands.append(self.apertures[aperture_id])
+        
+        return aperture_id
+    
+    def add_obround_aperture(self, width: float, height: float) -> int:
+        """
+        Define an obround aperture and return its ID.
+        
+        Args:
+            width: Obround width in current units
+            height: Obround height in current units
+            
+        Returns:
+            Aperture ID
+        """
+        aperture_id = self.next_aperture_id
+        self.next_aperture_id += 1
+        
+        self.apertures[aperture_id] = f"%ADD{aperture_id}O,{width:.6f}X{height:.6f}*%"
+        self.commands.append(self.apertures[aperture_id])
+        
+        return aperture_id
+    
+    def add_polygon_aperture(self, diameter: float, vertices: int, rotation: float = 0) -> int:
+        """
+        Define a polygon aperture and return its ID.
+        
+        Args:
+            diameter: Diameter of circumscribed circle in current units
+            vertices: Number of vertices
+            rotation: Rotation angle in degrees
+            
+        Returns:
+            Aperture ID
+        """
+        aperture_id = self.next_aperture_id
+        self.next_aperture_id += 1
+        
+        self.apertures[aperture_id] = f"%ADD{aperture_id}P,{diameter:.6f}X{vertices}X{rotation:.6f}*%"
+        self.commands.append(self.apertures[aperture_id])
+        
+        return aperture_id
+    
+    def add_custom_aperture_macro(self, primitives: List[str]) -> int:
+        """
+        Define a custom aperture macro and return its ID.
+        
+        Args:
+            primitives: List of aperture macro primitives
+            
+        Returns:
+            Macro ID
+        """
+        macro_id = self.next_macro_id
+        self.next_macro_id += 1
+        
+        macro_name = f"MACRO{macro_id}"
+        
+        # Construct the macro definition
+        macro_def = f"%AM{macro_name}*\n"
+        for primitive in primitives:
+            macro_def += primitive + "*\n"
+        macro_def += "%"
+        
+        self.macros[macro_name] = macro_def
+        self.commands.append(macro_def)
+        
+        return macro_id
+    
+    def add_macro_aperture(self, macro_id: int, parameters: List[float]) -> int:
+        """
+        Define an aperture using a macro and return its ID.
+        
+        Args:
+            macro_id: ID of the aperture macro
+            parameters: Parameters for the macro
+            
+        Returns:
+            Aperture ID
+        """
+        aperture_id = self.next_aperture_id
+        self.next_aperture_id += 1
+        
+        macro_name = f"MACRO{macro_id}"
+        
+        # Construct the aperture definition
+        param_str = ",".join([f"{param:.6f}" for param in parameters])
+        aperture_def = f"%ADD{aperture_id}{macro_name},{param_str}*%"
+        
+        self.apertures[aperture_id] = aperture_def
+        self.commands.append(aperture_def)
+        
+        return aperture_id
+    
+    def set_current_aperture(self, aperture_id: int) -> None:
+        """
+        Set the current aperture for drawing.
+        
+        Args:
+            aperture_id: ID of the aperture to use
+        """
+        if aperture_id in self.apertures:
+            self.current_aperture = aperture_id
+            self.commands.append(f"D{aperture_id}*")
+        else:
+            raise ValueError(f"Aperture ID {aperture_id} not defined")
+    
+    def move_to(self, x: float, y: float) -> None:
+        """
+        Move to position (x,y) without drawing.
+        
+        Args:
+            x, y: Coordinates to move to
+        """
+        self.commands.append(f"X{self._format_coord(x)}Y{self._format_coord(y)}D02*")
+    
+    def line_to(self, x: float, y: float) -> None:
+        """
+        Draw a line from current position to (x,y).
+        
+        Args:
+            x, y: Coordinates to draw to
+        """
+        self.commands.append(f"X{self._format_coord(x)}Y{self._format_coord(y)}D01*")
+    
+    def flash(self, x: float, y: float) -> None:
+        """
+        Flash the current aperture at position (x,y).
+        
+        Args:
+            x, y: Coordinates to flash at
+        """
+        self.commands.append(f"X{self._format_coord(x)}Y{self._format_coord(y)}D03*")
+    
+    def draw_line(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        """
+        Draw a line from (x1,y1) to (x2,y2) with current aperture.
+        
+        Args:
+            x1, y1: Start coordinates
+            x2, y2: End coordinates
+        """
+        if self.current_aperture is None:
+            raise ValueError("No current aperture selected")
+            
+        # Move to start point
+        self.move_to(x1, y1)
+        # Draw line to end point
+        self.line_to(x2, y2)
+    
+    def draw_polyline(self, points: List[Point]) -> None:
+        """
+        Draw a polyline defined by a list of points.
+        
+        Args:
+            points: List of points defining the polyline
+        """
+        if not points or len(points) < 2:
+            return
+            
+        if self.current_aperture is None:
+            raise ValueError("No current aperture selected")
+            
+        # Move to first point
+        self.move_to(points[0].x, points[0].y)
+        
+        # Draw lines to subsequent points
+        for point in points[1:]:
+            self.line_to(point.x, point.y)
+    
+    def draw_polygon(self, points: List[Point], filled: bool = True) -> None:
+        """
+        Draw a polygon defined by a list of points.
+        
+        Args:
+            points: List of points defining the polygon
+            filled: Whether the polygon should be filled
+        """
+        if not points or len(points) < 3:
+            return
+            
+        if self.current_aperture is None:
+            raise ValueError("No current aperture selected")
+            
+        # Start region mode if filled
+        if filled:
+            self.commands.append("G36*")
+        
+        # Move to first point
+        self.move_to(points[0].x, points[0].y)
+        
+        # Draw lines to subsequent points
+        for point in points[1:]:
+            self.line_to(point.x, point.y)
+            
+        # Close the polygon by drawing back to the first point
+        self.line_to(points[0].x, points[0].y)
+        
+        # End region mode if filled
+        if filled:
+            self.commands.append("G37*")
+    
+    def draw_circle(self, center: Point, radius: float, filled: bool = True, segments: int = 36) -> None:
+        """
+        Draw a circle.
+        
+        Args:
+            center: Center point of the circle
+            radius: Radius of the circle
+            filled: Whether the circle should be filled
+            segments: Number of segments to use for drawing the circle
+        """
+        points = []
+        for i in range(segments):
+            angle = 2 * math.pi * i / segments
+            point_x = center.x + radius * math.cos(angle)
+            point_y = center.y + radius * math.sin(angle)
+            points.append(Point(point_x, point_y))
+            
+        self.draw_polygon(points, filled)
+    
+    def draw_rectangle(self, x: float, y: float, width: float, height: float, filled: bool = True) -> None:
+        """
+        Draw a rectangle with bottom-left corner at (x,y).
+        
+        Args:
+            x, y: Coordinates of bottom-left corner
+            width: Width of rectangle
+            height: Height of rectangle
+            filled: Whether the rectangle should be filled
+        """
+        points = [
+            Point(x, y),
+            Point(x + width, y),
+            Point(x + width, y + height),
+            Point(x, y + height)
+        ]
+        self.draw_polygon(points, filled)
+    
+    def draw_component_outline(self, component: Component) -> None:
+        """
+        Draw component outline on silkscreen.
+        
+        Args:
+            component: Component to draw
+        """
+        # Calculate rotated corners
+        corners = []
+        for dx, dy in [
+            (-component.width/2, -component.height/2),
+            (component.width/2, -component.height/2),
+            (component.width/2, component.height/2),
+            (-component.width/2, component.height/2)
+        ]:
+            # Create corner point
+            corner = Point(component.position.x + dx, component.position.y + dy)
+            
+            # Rotate corner if component is rotated
+            if component.rotation != 0:
+                corner = corner.rotate(component.rotation, component.position)
+                
+            corners.append(corner)
+        
+        # Draw component outline
+        self.draw_polygon(corners, filled=False)
+        
+        # Draw reference designator
+        # In a real implementation, this would require text support
+        # Here we'll just add a comment
+        center = component.position
+        self.commands.append(f"# Reference: {component.reference} at ({center.x:.2f}, {center.y:.2f})")
+    
+    def end_file(self) -> None:
+        """Finish the Gerber file with appropriate footer."""
+        self.commands.append("M02*")  # End of file
+    
+    def export_to_file(self, filename: str) -> None:
+        """
+        Export the Gerber commands to a file.
+        
+        Args:
+            filename: Path to output file
+        """
+        with open(filename, 'w') as f:
+            for cmd in self.commands:
+                f.write(cmd + '\n')
+    
+    def get_content(self) -> str:
+        """
+        Get the Gerber file content as a string.
+        
+        Returns:
+            Gerber file content
+        """
+        return '\n'.join(self.commands)
+
+
+class CircuitIQ:
+    """
+    Main class for the Circuit IQ application.
+    Converts natural language and component specifications to PCB designs.
+    """
+    
+    def __init__(self, board_params: Union[Dict[str, Any], BoardParameters]):
+        """
+        Initialize the Circuit IQ application.
+        
+        Args:
+            board_params: Board parameters as dictionary or BoardParameters instance
+        """
+        # Convert board_params to BoardParameters if needed
+        if isinstance(board_params, dict):
+            self.board_params = BoardParameters(
+                width=board_params.get("width", 100),
+                height=board_params.get("height", 80),
+                layers=board_params.get("layers", 2),
+                trace_width=board_params.get("trace_width", 0.25),
+                clearance=board_params.get("clearance", 0.25),
+                edge_clearance=board_params.get("edge_clearance", 1.0),
+                board_outline_width=board_params.get("board_outline_width", 0.1),
+                copper_weight=board_params.get("copper_weight", 1.0),
+                soldermask_color=board_params.get("soldermask_color", "green"),
+                silkscreen_color=board_params.get("silkscreen_color", "white")
+            )
+        else:
+            self.board_params = board_params
+        
+        self.components = []
+        self.nets = []
+        self.output_dir = None
+    
+    def add_component(self, comp_data: Dict[str, Any]) -> Component:
+        """
+        Add a component to the design.
+        
+        Args:
+            comp_data: Component data dictionary
+            
+        Returns:
+            Created Component instance
+        """
+        comp_id = len(self.components)
+        component = Component.from_dict(comp_id, comp_data)
+        self.components.append(component)
+        return component
+    
+    def add_components(self, components_data: List[Dict[str, Any]]) -> List[Component]:
+        """
+        Add multiple components to the design.
+        
+        Args:
+            components_data: List of component data dictionaries
+            
+        Returns:
+            List of created Component instances
+        """
+        created_components = []
+        for comp_data in components_data:
+            component = self.add_component(comp_data)
+            created_components.append(component)
+        
+        return created_components
+    
+    def add_connection(self, from_comp_id: int, from_pin_id: int, 
+                      to_comp_id: int, to_pin_id: int, 
+                      net_name: Optional[str] = None) -> None:
+        """
+        Add a connection between two component pins.
+        
+        Args:
+            from_comp_id: ID of the source component
+            from_pin_id: Pin ID on the source component
+            to_comp_id: ID of the target component
+            to_pin_id: Pin ID on the target component
+            net_name: Optional name for the net
+        """
+        # Make sure a NetBuilder exists
+        if not hasattr(self, 'net_builder'):
+            self.net_builder = NetBuilder(self.components)
+        
+        # Add connection
+        self.net_builder.add_connection(from_comp_id, from_pin_id, to_comp_id, to_pin_id, net_name)
+    
+    def add_connections(self, connections: List[Dict[str, Any]]) -> None:
+        """
+        Add multiple connections to the design.
+        
+        Args:
+            connections: List of connection dictionaries
+        """
+        # Create NetBuilder
+        self.net_builder = NetBuilder(self.components)
+        
+        # Build nets from connections
+        self.nets = self.net_builder.build_from_connections(connections)
+    
+    def place_components(self) -> None:
+        """
+        Place components on the board.
+        
+        Implements a simple component placement algorithm based on connectivity.
+        """
+        # Skip if no components
+        if not self.components:
+            return
+        
+        logger.info("Placing components on board")
+        
+        # Start with a component in the center
+        center_x = self.board_params.width / 2
+        center_y = self.board_params.height / 2
+        
+        # Initialize the first component at the center
+        self.components[0].position = Point(center_x, center_y)
+        
+        # Calculate initial pin positions
+        for comp in self.components:
+            comp._calculate_pin_positions()
+        
+        # Place connected components
+        placed = {0}  # Set of placed component IDs
+        
+        # Continue until all components are placed or no more connections can be made
+        while len(placed) < len(self.components):
+            # Find a connection between a placed and an unplaced component
+            placed_this_round = set()
+            
+            for net in self.nets:
+                for comp1, pin1 in net.pins:
+                    for comp2, pin2 in net.pins:
+                        if comp1.id != comp2.id and (comp1.id in placed) != (comp2.id in placed):
+                            # Found a connection between placed and unplaced
+                            placed_comp = comp1 if comp1.id in placed else comp2
+                            unplaced_comp = comp2 if comp1.id in placed else comp1
+                            
+                            # Place the unplaced component near the placed one
+                            # Find a suitable position
+                            angle = 2 * math.pi * hash(f"{placed_comp.id}-{unplaced_comp.id}") / 0xFFFFFFFF
+                            distance = max(placed_comp.width, placed_comp.height) + max(unplaced_comp.width, unplaced_comp.height) / 2 + 5
+                            
+                            # Calculate position
+                            new_x = placed_comp.position.x + distance * math.cos(angle)
+                            new_y = placed_comp.position.y + distance * math.sin(angle)
+                            
+                            # Ensure component is within board boundaries
+                            edge_margin = 5  # mm from edge
+                            new_x = max(edge_margin + unplaced_comp.width/2, 
+                                       min(self.board_params.width - edge_margin - unplaced_comp.width/2, new_x))
+                            new_y = max(edge_margin + unplaced_comp.height/2, 
+                                       min(self.board_params.height - edge_margin - unplaced_comp.height/2, new_y))
+                            
+                            # Update component position
+                            unplaced_comp.position = Point(new_x, new_y)
+                            unplaced_comp._calculate_pin_positions()
+                            
+                            # Mark as placed
+                            placed_this_round.add(unplaced_comp.id)
+                            break
+                    if placed_this_round:
+                        break
+                if placed_this_round:
+                    break
+            
+            # If no components were placed this round, break to avoid infinite loop
+            if not placed_this_round:
+                # Place remaining components in a grid
+                unplaced = [comp for comp in self.components if comp.id not in placed]
+                
+                grid_size = int(math.ceil(math.sqrt(len(unplaced))))
+                cell_width = self.board_params.width / grid_size
+                cell_height = self.board_params.height / grid_size
+                
+                for i, component in enumerate(unplaced):
+                    row = i // grid_size
+                    col = i % grid_size
+                    
+                    # Center component in its cell
+                    x = col * cell_width + cell_width / 2
+                    y = row * cell_height + cell_height / 2
+                    
+                    # Update component position
+                    component.position = Point(x, y)
+                    component._calculate_pin_positions()
+                    
+                    # Mark as placed
+                    placed.add(component.id)
+                
+                break
+            
+            # Update placed set
+            placed.update(placed_this_round)
+        
+        logger.info(f"Placed {len(placed)} components")
+    
+    def route_traces(self) -> Dict[str, List[List[Point]]]:
+        """
+        Route traces for all nets.
+        
+        Returns:
+            Dictionary mapping net names to lists of paths
+        """
+        logger.info("Routing traces")
+        
+        # Create auto-router
+        router = AutoRouter(self.board_params)
+        
+        # Route nets
+        routed_nets = router.route_nets(self.nets)
+        
+        logger.info(f"Routed {len(routed_nets)} nets")
+        
+        return routed_nets
+    
+    def generate_gerber_files(self, output_dir: str) -> None:
+        """
+        Generate Gerber files for the PCB design.
+        
+        Args:
+            output_dir: Directory to output Gerber files
+        """
+        self.output_dir = output_dir
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Place components if not already placed
+        if any(comp.position.x == 0 and comp.position.y == 0 for comp in self.components):
+            self.place_components()
+        
+        # Route traces
+        routed_nets = self.route_traces()
+        
+        # Generate Gerber files
+        self._generate_copper_layers(routed_nets)
+        self._generate_soldermask_layers()
+        self._generate_silkscreen_layer()
+        self._generate_drill_file()
+        self._generate_outline_layer()
+        
+        # Generate README
+        self._generate_readme()
+        
+        logger.info(f"Generated Gerber files in {output_dir}")
+    
+    def _generate_copper_layers(self, routed_nets: Dict[str, List[List[Point]]]) -> None:
+        """
+        Generate copper layer Gerber files.
+        
+        Args:
+            routed_nets: Dictionary of routed nets
+        """
+        # Generate top copper layer
+        self._generate_copper_layer(1, routed_nets)
+        
+        # Generate bottom copper layer if 2-layer board
+        if self.board_params.layers >= 2:
+            self._generate_copper_layer(2, routed_nets)
+    
+    def _generate_copper_layer(self, layer: int, routed_nets: Dict[str, List[List[Point]]]) -> None:
+        """
+        Generate a single copper layer Gerber file.
+        
+        Args:
+            layer: Layer number (1 = top, 2 = bottom)
+            routed_nets: Dictionary of routed nets
+        """
+        layer_name = "top" if layer == 1 else "bottom"
+        filename = os.path.join(self.output_dir, f"pcb-{layer_name}-copper.gbr")
+        
+        gerb = AdvancedGerber()
+        gerb.begin_file()
+        
+        # Add apertures
+        trace_ap = gerb.add_circle_aperture(self.board_params.trace_width)
+        pad_ap = gerb.add_circle_aperture(1.0)  # Default pad size
+        
+        # Draw component pads
+        gerb.set_current_aperture(pad_ap)
+        
+        for component in self.components:
+            # Skip components on other layers
+            if (layer == 1 and component.layer != 1) or (layer == 2 and component.layer != 2):
+                continue
+                
+            for pin in component.pins:
+                gerb.flash(pin.position.x, pin.position.y)
+        
+        # Draw traces
+        gerb.set_current_aperture(trace_ap)
+        
+        for net_name, paths in routed_nets.items():
+            for path in paths:
+                gerb.draw_polyline([Point(p.x, p.y) for p in path])
+        
+        gerb.end_file()
+        gerb.export_to_file(filename)
+    
+    def _generate_soldermask_layers(self) -> None:
+        """Generate soldermask layer Gerber files."""
+        # Generate top soldermask
+        self._generate_soldermask_layer(1)
+        
+        # Generate bottom soldermask
+        self._generate_soldermask_layer(2)
+    
+    def _generate_soldermask_layer(self, layer: int) -> None:
+        """
+        Generate a single soldermask layer Gerber file.
+        
+        Args:
+            layer: Layer number (1 = top, 2 = bottom)
+        """
+        layer_name = "top" if layer == 1 else "bottom"
+        filename = os.path.join(self.output_dir, f"pcb-{layer_name}-soldermask.gbr")
+        
+        gerb = AdvancedGerber()
+        gerb.begin_file(polarity=GerberPolarityType.CLEAR)
+        
+        # Add aperture for pads (slightly larger than copper pads)
+        mask_ap = gerb.add_circle_aperture(1.2)  # Default pad size + mask expansion
+        gerb.set_current_aperture(mask_ap)
+        
+        # Draw mask openings for component pads
+        for component in self.components:
+            # Skip components on other layers
+            if (layer == 1 and component.layer != 1) or (layer == 2 and component.layer != 2):
+                continue
+                
+            for pin in component.pins:
+                gerb.flash(pin.position.x, pin.position.y)
+        
+        gerb.end_file()
+        gerb.export_to_file(filename)
+    
+    def _generate_silkscreen_layer(self) -> None:
+        """Generate silkscreen layer Gerber file."""
+        filename = os.path.join(self.output_dir, "pcb-silkscreen.gbr")
+        
+        gerb = AdvancedGerber()
+        gerb.begin_file()
+        
+        # Add aperture for silkscreen lines
+        silk_ap = gerb.add_circle_aperture(0.15)
+        gerb.set_current_aperture(silk_ap)
+        
+        # Draw component outlines
+        for component in self.components:
+            gerb.draw_component_outline(component)
+        
+        gerb.end_file()
+        gerb.export_to_file(filename)
+    
+    def _generate_drill_file(self) -> None:
+        """Generate Excellon drill file."""
+        filename = os.path.join(self.output_dir, "pcb-drill.xln")
+        
+        # Create Excellon drill file
+        with open(filename, 'w') as f:
+            # Write Excellon header
+            f.write("M48\n")           # Program header
+            f.write("METRIC,TZ\n")     # Metric units, trailing zeros
+            f.write("T1C0.8\n")        # Tool 1: 0.8mm drill for through-hole pins
+            f.write("%\n")             # End of header
+            f.write("T1\n")            # Select tool 1
+            
+            # Write drill coordinates for through-hole pins
+            for component in self.components:
+                # Skip SMD components
+                if component.is_smd:
+                    continue
+                    
+                for pin in component.pins:
+                    # Format coordinates with 3 decimal places
+                    x_drill = f"{pin.position.x:.3f}"
+                    y_drill = f"{pin.position.y:.3f}"
+                    f.write(f"X{x_drill}Y{y_drill}\n")
+            
+            # Add mounting holes if enabled
+            if self.board_params.mounting_holes:
+                # Add mounting holes at corners
+                inset = self.board_params.mounting_hole_inset
+                
+                # Top-left
+                f.write(f"X{inset:.3f}Y{inset:.3f}\n")
+                # Top-right
+                f.write(f"X{(self.board_params.width - inset):.3f}Y{inset:.3f}\n")
+                # Bottom-right
+                f.write(f"X{(self.board_params.width - inset):.3f}Y{(self.board_params.height - inset):.3f}\n")
+                # Bottom-left
+                f.write(f"X{inset:.3f}Y{(self.board_params.height - inset):.3f}\n")
+            
+            # End of program
+            f.write("M30\n")
+    
+    def _generate_outline_layer(self) -> None:
+        """Generate board outline Gerber file."""
+        filename = os.path.join(self.output_dir, "pcb-outline.gbr")
+        
+        gerb = AdvancedGerber()
+        gerb.begin_file()
+        
+        # Add aperture for outline
+        outline_ap = gerb.add_circle_aperture(self.board_params.board_outline_width)
+        gerb.set_current_aperture(outline_ap)
+        
+        # Draw board outline rectangle
+        gerb.draw_polyline([
+            Point(0, 0),
+            Point(self.board_params.width, 0),
+            Point(self.board_params.width, self.board_params.height),
+            Point(0, self.board_params.height),
+            Point(0, 0)
+        ])
+        
+        gerb.end_file()
+        gerb.export_to_file(filename)
+    
+    def _generate_readme(self) -> None:
+        """Generate a README file with PCB specifications."""
+        filename = os.path.join(self.output_dir, "README.txt")
+        
+        with open(filename, 'w') as f:
+            f.write("Circuit IQ - PCB Design Specification\n")
+            f.write("===================================\n\n")
+            
+            f.write(f"Board size: {self.board_params.width}mm x {self.board_params.height}mm\n")
+            f.write(f"Layers: {self.board_params.layers}\n")
+            f.write(f"Copper weight: {self.board_params.copper_weight}oz\n")
+            f.write(f"Soldermask color: {self.board_params.soldermask_color}\n")
+            f.write(f"Silkscreen color: {self.board_params.silkscreen_color}\n")
+            f.write(f"Components count: {len(self.components)}\n")
+            f.write(f"Nets count: {len(self.nets)}\n\n")
+            
+            f.write("Components:\n")
+            for comp in self.components:
+                f.write(f"- {comp.reference}: {comp.type}")
+                if comp.value:
+                    f.write(f", {comp.value}")
+                if comp.package:
+                    f.write(f", {comp.package}")
+                f.write("\n")
+            
+            f.write("\nGerber Files:\n")
+            f.write("- pcb-top-copper.gbr     - Top copper layer\n")
+            if self.board_params.layers >= 2:
+                f.write("- pcb-bottom-copper.gbr  - Bottom copper layer\n")
+            f.write("- pcb-top-soldermask.gbr  - Top soldermask\n")
+            f.write("- pcb-bottom-soldermask.gbr - Bottom soldermask\n")
+            f.write("- pcb-silkscreen.gbr     - Silkscreen\n")
+            f.write("- pcb-outline.gbr        - Board outline\n")
+            f.write("- pcb-drill.xln          - Drill file (Excellon format)\n\n")
+            
+            f.write("Generated by Circuit IQ Text-to-PCB Generator\n")
+    
+    def export_to_json(self, output_path: str) -> None:
+        """
+        Export PCB design to JSON format.
+        
+        Args:
+            output_path: Path to save JSON file
+        """
+        # Create serializable data structure
+        data = {
+            "board_parameters": {
+                "width": self.board_params.width,
+                "height": self.board_params.height,
+                "layers": self.board_params.layers,
+                "trace_width": self.board_params.trace_width,
+                "clearance": self.board_params.clearance,
+                "edge_clearance": self.board_params.edge_clearance,
+                "board_outline_width": self.board_params.board_outline_width,
+                "copper_weight": self.board_params.copper_weight,
+                "soldermask_color": self.board_params.soldermask_color,
+                "silkscreen_color": self.board_params.silkscreen_color
+            },
+            "components": [],
+            "nets": []
+        }
+        
+        # Add components
+        for component in self.components:
+            comp_data = {
+                "id": component.id,
+                "type": component.type,
+                "reference": component.reference,
+                "value": component.value,
+                "package": component.package,
+                "width": component.width,
+                "height": component.height,
+                "rotation": component.rotation,
+                "is_smd": component.is_smd,
+                "layer": component.layer,
+                "position": {
+                    "x": component.position.x,
+                    "y": component.position.y
+                },
+                "pins": [
+                    {
+                        "id": pin.id,
+                        "name": pin.name,
+                        "position": {
+                            "x": pin.position.x,
+                            "y": pin.position.y
+                        },
+                        "net_name": pin.net_name
+                    } for pin in component.pins
+                ]
+            }
+            data["components"].append(comp_data)
+        
+        # Add nets
+        for net in self.nets:
+            net_data = {
+                "id": net.id,
+                "name": net.name,
+                "width": net.width,
+                "pins": [
+                    {
+                        "component_id": comp.id,
+                        "pin_id": pin.id
+                    } for comp, pin in net.pins
+                ]
+            }
+            data["nets"].append(net_data)
+        
+        # Write to file
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            
+        logger.info(f"PCB design exported to JSON at {output_path}")
+            
+    def parse_component_from_text(self, text: str) -> Dict[str, Any]:
+        """
+        Parse component information from natural language text.
+        
+        Args:
+            text: Natural language description of a component
+            
+        Returns:
+            Component data dictionary
+        """
+        # This is a simplified parsing implementation
+        # In a real NLP system, this would use more sophisticated techniques
+        
+        component = {}
+        
+        # Try to identify component type
+        component_types = {
+            "resistor": ["resistor", "resistance", "ohm"],
+            "capacitor": ["capacitor", "cap", "farad", "uf", "nf", "pf"],
+            "led": ["led", "light emitting diode"],
+            "diode": ["diode", "rectifier"],
+            "transistor": ["transistor", "bjt", "mosfet", "fet"],
+            "microcontroller": ["microcontroller", "mcu", "arduino", "esp32", "esp8266", "attiny", "atmega"],
+            "ic": ["ic", "integrated circuit", "chip"],
+            "connector": ["connector", "header", "jack", "socket"],
+            "crystal": ["crystal", "oscillator", "resonator", "mhz", "khz"],
+            "inductor": ["inductor", "coil", "choke", "henry", "uh", "mh"],
+            "switch": ["switch", "button", "toggle"],
+            "relay": ["relay"],
+            "fuse": ["fuse"],
+            "regulator": ["regulator", "ldo", "voltage regulator"]
+        }
+        
+        text_lower = text.lower()
+        
+        # Find component type
+        for comp_type, keywords in component_types.items():
+            if any(keyword in text_lower for keyword in keywords):
+                component["type"] = comp_type
+                break
+        
+        if "type" not in component:
+            # Default to resistor if type not found
+            component["type"] = "resistor"
+        
+        # Try to extract value
+        value_patterns = {
+            "resistor": [
+                r"(\d+(?:\.\d+)?)\s*(?:ohm|Ω|R)",
+                r"(\d+(?:\.\d+)?)\s*k(?:ohm|Ω|R)",
+                r"(\d+(?:\.\d+)?)\s*M(?:ohm|Ω|R)"
+            ],
+            "capacitor": [
+                r"(\d+(?:\.\d+)?)\s*(?:F|farad)",
+                r"(\d+(?:\.\d+)?)\s*m(?:F|farad)",
+                r"(\d+(?:\.\d+)?)\s*µ(?:F|farad)",
+                r"(\d+(?:\.\d+)?)\s*u(?:F|farad)",
+                r"(\d+(?:\.\d+)?)\s*n(?:F|farad)",
+                r"(\d+(?:\.\d+)?)\s*p(?:F|farad)"
+            ],
+            "inductor": [
+                r"(\d+(?:\.\d+)?)\s*(?:H|henry)",
+                r"(\d+(?:\.\d+)?)\s*m(?:H|henry)",
+                r"(\d+(?:\.\d+)?)\s*µ(?:H|henry)",
+                r"(\d+(?:\.\d+)?)\s*u(?:H|henry)",
+                r"(\d+(?:\.\d+)?)\s*n(?:H|henry)"
+            ]
+        }
+        
+        comp_type = component["type"]
+        if comp_type in value_patterns:
+            for pattern in value_patterns[comp_type]:
+                match = re.search(pattern, text)
+                if match:
+                    component["value"] = match.group(0)
+                    break
+        
+        # Try to extract package
+        package_pattern = r"(?:package|pkg)?\s*(SOT-?\d+|SOIC-?\d+|DIP-?\d+|QFP-?\d+|TO-?\d+|0805|0603|1206)"
+        match = re.search(package_pattern, text, re.IGNORECASE)
+        if match:
+            component["package"] = match.group(1)
+        
+        # Try to extract pin count
+        pin_pattern = r"(\d+)\s*(?:pin|pins)"
+        match = re.search(pin_pattern, text, re.IGNORECASE)
+        if match:
+            component["pins"] = int(match.group(1))
+        else:
+            # Assign default pin count based on component type
+            default_pins = {
+                "resistor": 2,
+                "capacitor": 2,
+                "led": 2,
+                "diode": 2,
+                "transistor": 3,
+                "microcontroller": 8,
+                "ic": 8,
+                "connector": 4,
+                "crystal": 2,
+                "inductor": 2,
+                "switch": 2,
+                "relay": 4,
+                "fuse": 2,
+                "regulator": 3
+            }
+            component["pins"] = default_pins.get(comp_type, 2)
+        
+        # Try to extract reference designator
+        ref_pattern = r"(R\d+|C\d+|D\d+|Q\d+|U\d+|IC\d+|J\d+|SW\d+|L\d+|Y\d+|RY\d+|F\d+)"
+        match = re.search(ref_pattern, text)
+        if match:
+            component["reference"] = match.group(1)
+        
+        return component
+
+    def parse_components_from_text(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Parse multiple components from a text description.
+        
+        Args:
+            text: Text describing multiple components
+            
+        Returns:
+            List of component data dictionaries
+        """
+        components = []
+        
+        # Split text into lines or sentences
+        lines = re.split(r'[\n\.\;]', text)
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check if line describes a component
+            component_keywords = [
+                "resistor", "capacitor", "led", "diode", "transistor", 
+                "microcontroller", "ic", "connector", "crystal", "inductor",
+                "switch", "relay", "fuse", "regulator"
+            ]
+            
+            if any(keyword in line.lower() for keyword in component_keywords):
+                component = self.parse_component_from_text(line)
+                if component:
+                    components.append(component)
+        
+        return components
+
+    def parse_connections_from_text(self, text: str, components: List[Component]) -> List[Dict[str, Any]]:
+        """
+        Parse connections from a text description.
+        
+        Args:
+            text: Text describing connections
+            components: List of components
+            
+        Returns:
+            List of connection dictionaries
+        """
+        connections = []
+        
+        # Create component reference lookup
+        comp_by_ref = {comp.reference: comp.id for comp in components}
+        
+        # Split text into lines or sentences
+        lines = re.split(r'[\n\.\;]', text)
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Look for connection patterns
+            # Pattern 1: "Connect X pin Y to Z pin W"
+            pattern1 = r"[Cc]onnect\s+([A-Za-z]\d+)\s+pin\s+(\d+)\s+to\s+([A-Za-z]\d+)\s+pin\s+(\d+)"
+            match = re.search(pattern1, line)
+            
+            if match:
+                ref1, pin1, ref2, pin2 = match.groups()
+                
+                if ref1 in comp_by_ref and ref2 in comp_by_ref:
+                    connections.append({
+                        "from": {"component": comp_by_ref[ref1], "pin": int(pin1) - 1},  # Convert to 0-based
+                        "to": {"component": comp_by_ref[ref2], "pin": int(pin2) - 1}     # Convert to 0-based
+                    })
+                    continue
+            
+            # Pattern 2: "X pin Y connects to Z pin W"
+            pattern2 = r"([A-Za-z]\d+)\s+pin\s+(\d+)\s+connects\s+to\s+([A-Za-z]\d+)\s+pin\s+(\d+)"
+            match = re.search(pattern2, line)
+            
+            if match:
+                ref1, pin1, ref2, pin2 = match.groups()
+                
+                if ref1 in comp_by_ref and ref2 in comp_by_ref:
+                    connections.append({
+                        "from": {"component": comp_by_ref[ref1], "pin": int(pin1) - 1},
+                        "to": {"component": comp_by_ref[ref2], "pin": int(pin2) - 1}
+                    })
+                    continue
+            
+            # Pattern 3: "Connect X to Y"
+            pattern3 = r"[Cc]onnect\s+([A-Za-z]\d+)\s+to\s+([A-Za-z]\d+)"
+            match = re.search(pattern3, line)
+            
+            if match:
+                ref1, ref2 = match.groups()
+                
+                if ref1 in comp_by_ref and ref2 in comp_by_ref:
+                    # Default to pin 0 if not specified
+                    connections.append({
+                        "from": {"component": comp_by_ref[ref1], "pin": 0},
+                        "to": {"component": comp_by_ref[ref2], "pin": 0}
+                    })
+                    continue
+        
+        return connections
+
+    def generate_from_text(self, text: str, output_dir: str) -> None:
+        """
+        Generate a PCB design from natural language text.
+        
+        Args:
+            text: Natural language description of the PCB
+            output_dir: Directory to output Gerber files
+        """
+        logger.info("Generating PCB design from text")
+        
+        # Parse components
+        component_data = self.parse_components_from_text(text)
+        self.add_components(component_data)
+        
+        # Parse connections
+        connection_data = self.parse_connections_from_text(text, self.components)
+        self.add_connections(connection_data)
+        
+        # Generate Gerber files
+        self.generate_gerber_files(output_dir)
+        
+        # Export design to JSON
+        self.export_to_json(os.path.join(output_dir, "pcb_design.json"))
+        
+        logger.info(f"PCB design generated in {output_dir}")
+
+
+def parse_datasheet(datasheet_text: str) -> Dict[str, Any]:
+    """
+    Parse component information from a datasheet.
+    
+    Args:
+        datasheet_text: Text content of the datasheet
+        
+    Returns:
+        Component data dictionary
+    """
+    component = {}
+    
+    # Extract component type
+    type_patterns = {
+        "microcontroller": [r"microcontroller", r"MCU", r"microprocessor"],
+        "resistor": [r"resistor", r"resistance"],
+        "capacitor": [r"capacitor", r"capacitance"],
+        "diode": [r"diode", r"rectifier"],
+        "transistor": [r"transistor", r"BJT", r"MOSFET", r"FET"],
+        "ic": [r"integrated circuit", r"IC", r"chip"],
+        "led": [r"LED", r"light emitting diode"],
+        "connector": [r"connector", r"header", r"jack", r"socket"]
+    }
+    
+    for comp_type, patterns in type_patterns.items():
+        if any(re.search(pattern, datasheet_text, re.IGNORECASE) for pattern in patterns):
+            component["type"] = comp_type
+            break
+    
+    # Extract package information
+    package_pattern = r"Package(?:\s*Type)?(?:\s*\:)?\s*([A-Z0-9\-]+)"
+    match = re.search(package_pattern, datasheet_text, re.IGNORECASE)
+    if match:
+        component["package"] = match.group(1)
+    
+    # Extract pin count
+    pin_pattern = r"(\d+)(?:\s*|-)pin"
+    match = re.search(pin_pattern, datasheet_text, re.IGNORECASE)
+    if match:
+        component["pins"] = int(match.group(1))
+    
+    # Extract pin names
+    pin_names = []
+    pin_name_pattern = r"Pin\s+(\d+)(?:\s*\:)?\s*([A-Za-z0-9_\/]+)"
+    for match in re.finditer(pin_name_pattern, datasheet_text, re.IGNORECASE):
+        pin_number = int(match.group(1))
+        pin_name = match.group(2)
+        
+        # Ensure pin list is large enough
+        while len(pin_names) < pin_number:
+            pin_names.append(None)
+            
+        pin_names[pin_number - 1] = pin_name
+    
+    if pin_names:
+        component["pin_names"] = pin_names
+    
+    return component
+
+
+# Example usage
+def main():
+    """Example usage of CircuitIQ."""
+    
+    # Example components with more realistic properties
+    components = [
+        {
+            "type": "microcontroller", 
+            "pins": 8, 
+            "value": "ATtiny85", 
+            "reference": "U1",
+            "package": "SOIC-8"
+        },
+        {
+            "type": "resistor", 
+            "pins": 2, 
+            "value": "10K", 
+            "reference": "R1"
+        },
+        {
+            "type": "resistor", 
+            "pins": 2, 
+            "value": "1K", 
+            "reference": "R2"
+        },
+        {
+            "type": "capacitor", 
+            "pins": 2, 
+            "value": "0.1uF", 
+            "reference": "C1"
+        },
+        {
+            "type": "led", 
+            "pins": 2, 
+            "value": "Green", 
+            "reference": "D1"
+        }
+    ]
+    
+    # Example connections with net names
+    connections = [
+        {"from": {"component": 0, "pin": 0}, "to": {"component": 1, "pin": 0}, "net_name": "VCC"},
+        {"from": {"component": 0, "pin": 1}, "to": {"component": 2, "pin": 0}, "net_name": "GPIO1"},
+        {"from": {"component": 0, "pin": 2}, "to": {"component": 3, "pin": 0}, "net_name": "RESET"},
+        {"from": {"component": 0, "pin": 3}, "to": {"component": 4, "pin": 0}, "net_name": "GPIO2"},
+        {"from": {"component": 1, "pin": 1}, "to": {"component": 4, "pin": 1}, "net_name": "GND"},
+        {"from": {"component": 2, "pin": 1}, "to": {"component": 3, "pin": 1}, "net_name": "GND"}
+    ]
+    
+    # Board parameters
+    board_params = {
+        "width": 100,
+        "height": 80,
+        "layers": 2,
+        "trace_width": 0.25,
+        "clearance": 0.25,
+        "edge_clearance": 1.0,
+        "board_outline_width": 0.1,
+        "copper_weight": 1.0,
+        "soldermask_color": "green",
+        "silkscreen_color": "white"
+    }
+    
+    # Create CircuitIQ instance
+    circuit_iq = CircuitIQ(board_params)
+    
+    # Add components and connections
+    circuit_iq.add_components(components)
+    circuit_iq.add_connections(connections)
+    
+    # Create output directory
+    output_dir = "circuit_iq_output"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate Gerber files
+    circuit_iq.generate_gerber_files(output_dir)
+    
+    # Export design to JSON
+    circuit_iq.export_to_json(os.path.join(output_dir, "pcb_design.json"))
+    
+    print(f"PCB design generated in {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
