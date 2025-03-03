@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Driven PCB Designer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .datasheet-container {
+            border: 1px solid #ccc;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 5px;
+        }
+        .preview-container {
+            border: 1px solid #ddd;
+            padding: 10px;
+            min-height: 300px;
+            margin-top: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .preview-container img {
+            max-width: 100%;
+            max-height: 300px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-5">
+        <h1 class="text-center mb-4">AI-Driven PCB Designer</h1>
+        
+        <div class="row">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Input Data</h3>
+                    </div>
+                    <div class="card-body">
+                        <form id="pcbDesignForm">
+                            <div class="mb-3">
+                                <label for="requirements" class="form-label">Circuit Requirements</label>
+                                <textarea class="form-control" id="requirements" rows="4" placeholder="Describe what you want the circuit to do..."></textarea>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <h5>Component Datasheets</h5>
+                                <div id="datasheetList">
+                                    <div class="datasheet-container">
+                                        <div class="mb-3">
+                                            <label class="form-label">Component Name</label>
+                                            <input type="text" class="form-control component-name" placeholder="e.g., ATmega328P">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">Datasheet Content or PDF</label>
+                                            <textarea class="form-control datasheet-content" rows="3" placeholder="Paste key information from datasheet..."></textarea>
+                                            <div class="mt-2">
+                                                <input type="file" class="form-control datasheet-file" accept=".pdf">
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button type="button" id="addDatasheet" class="btn btn-secondary">Add Another Component</button>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <h5>Board Parameters</h5>
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <label class="form-label">Width (mm)</label>
+                                        <input type="number" class="form-control" id="boardWidth" value="100">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Height (mm)</label>
+                                        <input type="number" class="form-control" id="boardHeight" value="80">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Layers</label>
+                                        <select class="form-control" id="boardLayers">
+                                            <option value="1">1 (Single sided)</option>
+                                            <option value="2">2 (Double sided)</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Trace Width (mm)</label>
+                                        <input type="number" class="form-control" id="traceWidth" value="0.25" step="0.05">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <button type="submit" class="btn btn-primary">Generate PCB Design</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>PCB Design Output</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="loadingIndicator" style="display: none;">
+                            <div class="d-flex justify-content-center">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                            </div>
+                            <p class="text-center mt-2">Analyzing datasheets and generating PCB design...</p>
+                        </div>
+                        
+                        <div id="outputContainer" style="display: none;">
+                            <h5>PCB Preview</h5>
+                            <div class="preview-container">
+                                <img id="pcbPreview" src="" alt="PCB Preview">
+                            </div>
+                            
+                            <h5 class="mt-4">Gerber Files</h5>
+                            <ul id="gerberFilesList" class="list-group">
+                                <!-- Gerber files will be listed here -->
+                            </ul>
+                            
+                            <div class="mt-4">
+                                <button id="downloadAllBtn" class="btn btn-success">Download All Gerber Files</button>
+                                <button id="simulateBtn" class="btn btn-info">Open in Simulator</button>
+                            </div>
+                        </div>
+                        
+                        <div id="errorContainer" class="alert alert-danger mt-3" style="display: none;">
+                            <!-- Error messages will appear here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add new datasheet entry
+            document.getElementById('addDatasheet').addEventListener('click', function() {
+                const datasheetList = document.getElementById('datasheetList');
+                const newDatasheet = document.createElement('div');
+                newDatasheet.className = 'datasheet-container';
+                newDatasheet.innerHTML = `
+                    <div class="mb-3">
+                        <label class="form-label">Component Name</label>
+                        <input type="text" class="form-control component-name" placeholder="e.g., ATmega328P">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Datasheet Content or PDF</label>
+                        <textarea class="form-control datasheet-content" rows="3" placeholder="Paste key information from datasheet..."></textarea>
+                        <div class="mt-2">
+                            <input type="file" class="form-control datasheet-file" accept=".pdf">
+                        </div>
+                    </div>
+                    <button type="button" class="btn btn-outline-danger btn-sm remove-datasheet">Remove</button>
+                `;
+                datasheetList.appendChild(newDatasheet);
+                
+                // Add event listener for remove button
+                newDatasheet.querySelector('.remove-datasheet').addEventListener('click', function() {
+                    datasheetList.removeChild(newDatasheet);
+                });
+                
+                // Add event listener for PDF file upload
+                setupFileUploadListener(newDatasheet.querySelector('.datasheet-file'), newDatasheet.querySelector('.datasheet-content'));
+            });
+            
+            // Setup PDF file upload listeners
+            document.querySelectorAll('.datasheet-file').forEach(fileInput => {
+                const contentTextarea = fileInput.closest('.datasheet-container').querySelector('.datasheet-content');
+                setupFileUploadListener(fileInput, contentTextarea);
+            });
+            
+            // Form submission
+            document.getElementById('pcbDesignForm').addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                // Show loading indicator
+                document.getElementById('loadingIndicator').style.display = 'block';
+                document.getElementById('outputContainer').style.display = 'none';
+                document.getElementById('errorContainer').style.display = 'none';
+                
+                // Collect datasheets
+                const datasheets = [];
+                document.querySelectorAll('.datasheet-container').forEach(container => {
+                    const name = container.querySelector('.component-name').value;
+                    const content = container.querySelector('.datasheet-content').value;
+                    if (name && content) {
+                        datasheets.push({
+                            name: name,
+                            content: content
+                        });
+                    }
+                });
+                
+                // Collect board parameters
+                const boardParams = {
+                    width: parseFloat(document.getElementById('boardWidth').value),
+                    height: parseFloat(document.getElementById('boardHeight').value),
+                    layers: parseInt(document.getElementById('boardLayers').value),
+                    trace_width: parseFloat(document.getElementById('traceWidth').value)
+                };
+                
+                // Prepare data for API
+                const requestData = {
+                    requirements: document.getElementById('requirements').value,
+                    datasheets: datasheets,
+                    board_params: boardParams
+                };
+                
+                // For the MVP demo, we'll simulate the API call
+                setTimeout(() => {
+                    simulateApiResponse(requestData);
+                }, 3000);
+                
+                // In a real implementation, you would call your API
+                /*
+                fetch('/api/design_pcb', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestData)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        showResults(data);
+                    } else {
+                        showError(data.message);
+                    }
+                })
+                .catch(error => {
+                    showError('Failed to communicate with the server: ' + error.message);
+                })
+                .finally(() => {
+                    document.getElementById('loadingIndicator').style.display = 'none';
+                });
+                */
+            });
+            
+            // Initialize the simulation buttons
+            document.getElementById('simulateBtn').addEventListener('click', function() {
+                window.open('https://www.gerblook.org/', '_blank');
+            });
+            
+            document.getElementById('downloadAllBtn').addEventListener('click', function() {
+                alert('In a production app, this would download a zip file with all Gerber files.');
+            });
+        });
+        
+        function setupFileUploadListener(fileInput, contentTextarea) {
+            fileInput.addEventListener('change', function(e) {
+                if (e.target.files.length > 0) {
+                    const file = e.target.files[0];
+                    // In a real app, this would use PDF.js or a backend API to extract text
+                    contentTextarea.value = `Type: Extracted from ${file.name}\nPart Number: DEMO123\nPackage: SOIC-8\nPins: 8\nVoltage: 3.3V\nCurrent: 100mA`;
+                }
+            });
+        }
+        
+        function simulateApiResponse(requestData) {
+            // Hide loading indicator
+            document.getElementById('loadingIndicator').style.display = 'none';
+            
+            // For demo purposes, generate a simulated response
+            const success = Math.random() > 0.2; // 80% chance of success
+            
+            if (success) {
+                // Create simulated Gerber files based on requirements
+                const gerberFiles = [
+                    { name: 'F_Cu.gbr', url: '#' },
+                    { name: 'F_Mask.gbr', url: '#' },
+                    { name: 'F_SilkS.gbr', url: '#' },
+                    { name: 'Edge_Cuts.gbr', url: '#' },
+                    { name: 'board.drl', url: '#' }
+                ];
+                
+                if (requestData.board_params.layers > 1) {
+                    gerberFiles.push({ name: 'B_Cu.gbr', url: '#' });
+                    gerberFiles.push({ name: 'B_Mask.gbr', url: '#' });
+                    gerberFiles.push({ name: 'B_SilkS.gbr', url: '#' });
+                }
+                
+                showResults({
+                    preview_url: '/static/preview.png', // In a real app, this would be dynamically generated
+                    gerber_files: gerberFiles
+                });
+            } else {
+                showError('Failed to generate PCB design. Please check your input parameters and try again.');
+            }
+        }
+        
+        function showResults(data) {
+            const outputContainer = document.getElementById('outputContainer');
+            outputContainer.style.display = 'block';
+            
+            // Set preview
+            document.getElementById('pcbPreview').src = data.preview_url || 'https://via.placeholder.com/400x300?text=PCB+Preview';
+            
+            // Populate Gerber files list
+            const gerberList = document.getElementById('gerberFilesList');
+            gerberList.innerHTML = '';
+            
+            data.gerber_files.forEach(file => {
+                const listItem = document.createElement('li');
+                listItem.className = 'list-group-item d-flex justify-content-between align-items-center';
+                listItem.innerHTML = `
+                    ${file.name}
+                    <a href="${file.url}" download class="btn btn-sm btn-outline-primary">Download</a>
+                `;
+                gerberList.appendChild(listItem);
+            });
+        }
+        
+        function showError(message) {
+            document.getElementById('errorContainer').style.display = 'block';
+            document.getElementById('errorContainer').textContent = message;
+        }
