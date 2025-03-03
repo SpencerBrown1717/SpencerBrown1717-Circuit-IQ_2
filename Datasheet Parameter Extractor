@@ -1,0 +1,231 @@
+import os
+import re
+import PyPDF2
+import spacy
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from transformers import pipeline
+
+class DatasheetExtractor:
+    def __init__(self):
+        # Initialize the NLP models
+        # For MVP simplicity, we'll use a basic NER model
+        # In a production system, you'd use a specialized model trained on datasheets
+        self.nlp = spacy.load("en_core_web_sm")
+        
+        # Initialize transformer model for more specialized extraction
+        # This would be a custom-trained model in production
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            self.model = AutoModelForTokenClassification.from_pretrained("bert-base-uncased")
+            self.ner_pipeline = pipeline("ner", model=self.model, tokenizer=self.tokenizer)
+        except:
+            self.ner_pipeline = None
+            print("Transformer models not loaded, falling back to regex patterns")
+    
+    def extract_from_pdf(self, pdf_path):
+        """Extract text content from a PDF datasheet"""
+        text = ""
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page_num in range(len(reader.pages)):
+                    text += reader.pages[page_num].extract_text() + "\n"
+        except Exception as e:
+            print(f"Error extracting text from PDF: {e}")
+        
+        return text
+    
+    def extract_parameters(self, text):
+        """Extract key component parameters from datasheet text"""
+        parameters = {}
+        
+        # 1. Use regex patterns for common datasheet parameters
+        # Component type
+        type_patterns = [
+            r'(?i)Type:\s*([\w\s-]+)',
+            r'(?i)Component Type:\s*([\w\s-]+)',
+            r'(?i)Device Type:\s*([\w\s-]+)'
+        ]
+        
+        for pattern in type_patterns:
+            match = re.search(pattern, text)
+            if match:
+                parameters['type'] = match.group(1).strip()
+                break
+        
+        # Part number
+        part_patterns = [
+            r'(?i)Part Number:\s*([\w\d-]+)',
+            r'(?i)P/N:\s*([\w\d-]+)',
+            r'(?i)Model:\s*([\w\d-]+)'
+        ]
+        
+        for pattern in part_patterns:
+            match = re.search(pattern, text)
+            if match:
+                parameters['part_number'] = match.group(1).strip()
+                break
+        
+        # Package type
+        package_patterns = [
+            r'(?i)Package:\s*([\w\d-]+)',
+            r'(?i)Package Type:\s*([\w\d-]+)',
+            r'(?i)Case Style:\s*([\w\d-]+)'
+        ]
+        
+        for pattern in package_patterns:
+            match = re.search(pattern, text)
+            if match:
+                parameters['package'] = match.group(1).strip()
+                break
+        
+        # Pin count
+        pin_patterns = [
+            r'(?i)Pins:\s*(\d+)',
+            r'(?i)Pin Count:\s*(\d+)',
+            r'(?i)Number of Pins:\s*(\d+)'
+        ]
+        
+        for pattern in pin_patterns:
+            match = re.search(pattern, text)
+            if match:
+                parameters['pins'] = int(match.group(1))
+                break
+        
+        # Operating voltage
+        voltage_patterns = [
+            r'(?i)Operating Voltage:\s*([\d\.]+)\s*(?:to|-)?\s*([\d\.]+)?\s*V',
+            r'(?i)Supply Voltage:\s*([\d\.]+)\s*(?:to|-)?\s*([\d\.]+)?\s*V',
+            r'(?i)VCC:\s*([\d\.]+)\s*(?:to|-)?\s*([\d\.]+)?\s*V'
+        ]
+        
+        for pattern in voltage_patterns:
+            match = re.search(pattern, text)
+            if match:
+                if match.group(2):
+                    parameters['voltage_range'] = [float(match.group(1)), float(match.group(2))]
+                else:
+                    parameters['voltage'] = float(match.group(1))
+                break
+        
+        # 2. Use NLP to extract additional parameters
+        # This is a simplified example - in production you'd use a specialized model
+        doc = self.nlp(text[:10000])  # Process first 10000 chars to avoid memory issues
+        
+        # Look for temperatures
+        temp_entities = []
+        for ent in doc.ents:
+            if ent.label_ == "QUANTITY" and "°C" in ent.text:
+                temp_entities.append(ent.text)
+        
+        if temp_entities:
+            parameters['temperature_info'] = temp_entities[:3]  # Limit to first 3 matches
+        
+        # 3. Classify component type if not found by regex
+        if 'type' not in parameters:
+            component_types = {
+                'resistor': ['resistor', 'resistance', 'ohm'],
+                'capacitor': ['capacitor', 'capacitance', 'farad', 'pF', 'nF', 'µF', 'mF'],
+                'inductor': ['inductor', 'inductance', 'henry', 'µH', 'mH'],
+                'diode': ['diode', 'rectifier'],
+                'LED': ['led', 'light emitting diode'],
+                'transistor': ['transistor', 'bjt', 'fet', 'mosfet'],
+                'microcontroller': ['microcontroller', 'mcu', 'cpu', 'processor'],
+                'regulator': ['regulator', 'voltage regulator', 'ldo']
+            }
+            
+            text_lower = text.lower()
+            for comp_type, keywords in component_types.items():
+                if any(keyword in text_lower for keyword in keywords):
+                    parameters['type'] = comp_type
+                    break
+        
+        return parameters
+    
+    def detect_component_connections(self, text):
+        """Identify likely pin connections based on datasheet content"""
+        connections = []
+        
+        # Simplified pattern matching for pin function descriptions
+        pin_functions = re.findall(r'Pin\s*(\d+)[:\s]+([A-Za-z0-9_\s/]+)', text)
+        
+        # Categorize pins
+        power_pins = []
+        ground_pins = []
+        io_pins = []
+        
+        for pin_num, description in pin_functions:
+            pin_info = {
+                'number': int(pin_num),
+                'description': description.strip()
+            }
+            
+            desc_lower = description.lower()
+            if any(term in desc_lower for term in ['vcc', 'vdd', 'power', 'supply']):
+                pin_info['category'] = 'power'
+                power_pins.append(pin_info)
+            elif any(term in desc_lower for term in ['gnd', 'ground', 'vss']):
+                pin_info['category'] = 'ground'
+                ground_pins.append(pin_info)
+            elif any(term in desc_lower for term in ['gpio', 'i/o', 'input', 'output']):
+                pin_info['category'] = 'io'
+                io_pins.append(pin_info)
+            else:
+                pin_info['category'] = 'other'
+                io_pins.append(pin_info)
+            
+            connections.append(pin_info)
+        
+        return {
+            'all_pins': connections,
+            'power_pins': power_pins,
+            'ground_pins': ground_pins,
+            'io_pins': io_pins
+        }
+    
+    def process_datasheet(self, source):
+        """Process a datasheet from either PDF file or text content"""
+        if os.path.isfile(source) and source.lower().endswith('.pdf'):
+            text = self.extract_from_pdf(source)
+        else:
+            text = source  # Assume source is already text content
+        
+        parameters = self.extract_parameters(text)
+        connections = self.detect_component_connections(text)
+        
+        return {
+            'parameters': parameters,
+            'connections': connections,
+            'raw_text_sample': text[:500] + ('...' if len(text) > 500 else '')
+        }
+
+# Example usage
+if __name__ == "__main__":
+    extractor = DatasheetExtractor()
+    
+    # Example with text content
+    sample_text = """
+    LM7805 Voltage Regulator
+    
+    Type: Voltage Regulator
+    Part Number: LM7805
+    Package: TO-220
+    Pins: 3
+    
+    The LM7805 is a 5V voltage regulator with thermal overload protection.
+    
+    Electrical Characteristics:
+    - Input Voltage: 7V to 35V
+    - Output Voltage: 5V ± 0.25V
+    - Maximum Output Current: 1.5A
+    - Operating Temperature: 0°C to 125°C
+    
+    Pin Configuration:
+    Pin 1: Input
+    Pin 2: Ground
+    Pin 3: Output (5V)
+    """
+    
+    result = extractor.process_datasheet(sample_text)
+    print("Extracted Parameters:", result['parameters'])
+    print("Pin Connections:", result['connections'])
