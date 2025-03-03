@@ -3,6 +3,7 @@ import json
 import tempfile
 import zipfile
 import base64
+import logging
 from io import BytesIO
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
@@ -12,82 +13,320 @@ from datasheet_extractor import DatasheetExtractor
 from gerber_generator import GerberGenerator
 from pcb_visualizer import PCBVisualizer
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('CircuitIQ-Backend')
+
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 class PCBDesigner:
+    """
+    Main PCB Designer class that orchestrates the circuit design process
+    from natural language requirements and datasheets to gerber files
+    """
     def __init__(self):
         self.datasheet_extractor = DatasheetExtractor()
         self.components = []
         self.board_params = {}
         self.requirements = ""
+        
+        # Library of common components with their footprints
         self.component_library = {
-            "resistor": {"footprint": "R_0805_2012Metric", "pins": 2},
-            "capacitor": {"footprint": "C_0805_2012Metric", "pins": 2},
-            "LED": {"footprint": "LED_0805_2012Metric", "pins": 2},
-            "microcontroller": {"footprint": "LQFP-32_7x7mm_P0.8mm", "pins": 32},
+            "resistor": {
+                "footprint": "R_0805_2012Metric", 
+                "pins": 2,
+                "symbol": "Device:R"
+            },
+            "capacitor": {
+                "footprint": "C_0805_2012Metric", 
+                "pins": 2,
+                "symbol": "Device:C"
+            },
+            "LED": {
+                "footprint": "LED_0805_2012Metric", 
+                "pins": 2,
+                "symbol": "Device:LED"
+            },
+            "microcontroller": {
+                "footprint": "LQFP-32_7x7mm_P0.8mm", 
+                "pins": 32,
+                "symbol": "MCU_Microchip_ATmega:ATmega328P-AU"
+            },
+            "regulator": {
+                "footprint": "TO-220-3_Vertical", 
+                "pins": 3,
+                "symbol": "Regulator_Linear:LM7805_TO220"
+            },
+            "diode": {
+                "footprint": "D_SOD-323", 
+                "pins": 2,
+                "symbol": "Device:D"
+            },
+            "transistor": {
+                "footprint": "SOT-23", 
+                "pins": 3,
+                "symbol": "Device:Q_NPN_BCE"
+            },
+            "sensor": {
+                "footprint": "SOT-23-5", 
+                "pins": 5,
+                "symbol": "Sensor:Temperature_Sensor"
+            },
+            "connector": {
+                "footprint": "PinHeader_1x05_P2.54mm_Vertical", 
+                "pins": 5,
+                "symbol": "Connector:Conn_01x05_Male"
+            }
         }
     
     def process_datasheets(self, datasheets):
-        """Process datasheet information to extract component parameters"""
+        """
+        Process datasheet information to extract component parameters
+        
+        Args:
+            datasheets: List of datasheet objects (dict with content/name or file paths)
+            
+        Returns:
+            List of extracted component parameters
+        """
+        logger.info(f"Processing {len(datasheets)} datasheets")
         components = []
         
         for datasheet in datasheets:
-            # Extract data from datasheet text or file
-            if isinstance(datasheet, dict) and 'content' in datasheet:
-                # Process text content
-                result = self.datasheet_extractor.process_datasheet(datasheet['content'])
-                component = result['parameters']
-                
-                # Add component name if provided
-                if 'name' in datasheet:
-                    component['name'] = datasheet['name']
-                
-                # Add to components list if valid
-                if component.get('type') and component.get('type') != 'unknown':
-                    components.append(component)
-            elif isinstance(datasheet, str) and os.path.isfile(datasheet):
-                # Process datasheet file
-                result = self.datasheet_extractor.process_datasheet(datasheet)
-                component = result['parameters']
-                
-                # Add to components list if valid
-                if component.get('type') and component.get('type') != 'unknown':
-                    components.append(component)
+            try:
+                # Extract data from datasheet text or file
+                if isinstance(datasheet, dict):
+                    # Get component name if provided
+                    component_name = datasheet.get('name', 'Unknown Component')
+                    
+                    # Process text content if provided
+                    if 'content' in datasheet and datasheet['content']:
+                        logger.info(f"Processing datasheet content for {component_name}")
+                        result = self.datasheet_extractor.process_datasheet(datasheet['content'])
+                        component = result['parameters']
+                        component['name'] = component_name
+                        
+                        # Add connections if available
+                        if 'connections' in result and result['connections']['all_pins']:
+                            component['pins'] = len(result['connections']['all_pins'])
+                            component['connections'] = result['connections']
+                            
+                        # Add to components list if valid
+                        if component.get('type'):
+                            components.append(component)
+                    else:
+                        logger.warning(f"No content provided for {component_name}")
+                        
+                        # Still add basic component info
+                        component = {'name': component_name}
+                        if 'type' in datasheet:
+                            component['type'] = datasheet['type']
+                        components.append(component)
+                        
+                elif isinstance(datasheet, str) and os.path.isfile(datasheet):
+                    # Process datasheet file
+                    logger.info(f"Processing datasheet file: {datasheet}")
+                    result = self.datasheet_extractor.process_datasheet(datasheet)
+                    component = result['parameters']
+                    
+                    # Extract file name as component name if not provided
+                    if 'name' not in component:
+                        file_name = os.path.basename(datasheet)
+                        component['name'] = os.path.splitext(file_name)[0]
+                    
+                    # Add connections if available
+                    if 'connections' in result and result['connections']['all_pins']:
+                        component['pins'] = len(result['connections']['all_pins'])
+                        component['connections'] = result['connections']
+                    
+                    # Add to components list if valid
+                    if component.get('type'):
+                        components.append(component)
+            except Exception as e:
+                logger.error(f"Error processing datasheet: {e}")
+        
+        # Enrich components with library data
+        self._enrich_components(components)
         
         self.components = components
         return components
     
+    def _enrich_components(self, components):
+        """
+        Enrich components with data from the component library
+        
+        Args:
+            components: List of component dictionaries to enrich
+        """
+        for component in components:
+            component_type = component.get('type', '').lower()
+            
+            # Find matching component in library
+            for lib_type, lib_data in self.component_library.items():
+                if component_type and lib_type in component_type:
+                    # If pins are not specified, use library value
+                    if 'pins' not in component:
+                        component['pins'] = lib_data['pins']
+                    
+                    # Add footprint and symbol
+                    component['footprint'] = lib_data['footprint']
+                    component['symbol'] = lib_data['symbol']
+                    break
+            
+            # Default values if not found in library
+            if 'footprint' not in component:
+                component['footprint'] = "Generic_Footprint"
+            if 'symbol' not in component:
+                component['symbol'] = "Device:Unknown"
+    
     def analyze_requirements(self, requirements_text):
-        """Analyze the textual requirements to determine circuit needs"""
+        """
+        Analyze the textual requirements to determine circuit needs
+        
+        Args:
+            requirements_text: Natural language description of circuit requirements
+            
+        Returns:
+            Dictionary with circuit needs and components
+        """
+        logger.info("Analyzing requirements text")
         self.requirements = requirements_text
+        
+        # Skip if no requirements
+        if not requirements_text:
+            return {
+                "circuit_needs": {},
+                "components": self.components
+            }
         
         # Simple keyword-based analysis
         requirements_lower = requirements_text.lower()
         circuit_needs = {
-            "power_regulation": any(word in requirements_lower for word in ["power", "voltage", "regulator", "supply"]),
-            "microcontroller": any(word in requirements_lower for word in ["microcontroller", "mcu", "processor", "control"]),
-            "led_indicators": any(word in requirements_lower for word in ["led", "indicator", "light", "display"]),
-            "sensors": any(word in requirements_lower for word in ["sensor", "measure", "detect", "monitor"]),
+            "power_regulation": any(word in requirements_lower for word in 
+                                   ["power", "voltage", "regulator", "battery", "supply", "v", "volt"]),
+            "microcontroller": any(word in requirements_lower for word in 
+                                  ["microcontroller", "arduino", "mcu", "processor", "control", "atmega"]),
+            "led_indicators": any(word in requirements_lower for word in 
+                                 ["led", "indicator", "light", "display", "blink"]),
+            "sensors": any(word in requirements_lower for word in 
+                          ["sensor", "measure", "detect", "monitor", "temperature", "humidity", "pressure"]),
+            "motor_control": any(word in requirements_lower for word in 
+                               ["motor", "driver", "actuator", "servo", "stepper"]),
+            "connectivity": any(word in requirements_lower for word in 
+                               ["connect", "interface", "usb", "bluetooth", "wireless", "i2c", "spi", "uart"])
         }
         
+        logger.info(f"Circuit needs: {circuit_needs}")
+        
         # Add missing essential components based on requirements
+        # Power regulation
         if circuit_needs["power_regulation"] and not any(c.get('type') == 'regulator' for c in self.components):
-            self.components.append({'type': 'regulator', 'pins': 3, 'name': 'Power Regulator'})
+            self.components.append({
+                'type': 'regulator', 
+                'pins': 3, 
+                'name': 'Power Regulator',
+                'footprint': self.component_library['regulator']['footprint'],
+                'symbol': self.component_library['regulator']['symbol']
+            })
+            
+            # Add input/output capacitors for regulator
+            self.components.append({
+                'type': 'capacitor',
+                'pins': 2,
+                'name': 'Input Capacitor',
+                'footprint': self.component_library['capacitor']['footprint'],
+                'symbol': self.component_library['capacitor']['symbol']
+            })
+            
+            self.components.append({
+                'type': 'capacitor',
+                'pins': 2,
+                'name': 'Output Capacitor',
+                'footprint': self.component_library['capacitor']['footprint'],
+                'symbol': self.component_library['capacitor']['symbol']
+            })
         
+        # Microcontroller
         if circuit_needs["microcontroller"] and not any(c.get('type') == 'microcontroller' for c in self.components):
-            self.components.append({'type': 'microcontroller', 'pins': 32, 'name': 'Microcontroller'})
+            self.components.append({
+                'type': 'microcontroller', 
+                'pins': 32, 
+                'name': 'Microcontroller',
+                'footprint': self.component_library['microcontroller']['footprint'],
+                'symbol': self.component_library['microcontroller']['symbol']
+            })
+            
+            # Add decoupling capacitor for microcontroller
+            self.components.append({
+                'type': 'capacitor',
+                'pins': 2,
+                'name': 'Decoupling Capacitor',
+                'footprint': self.component_library['capacitor']['footprint'],
+                'symbol': self.component_library['capacitor']['symbol']
+            })
         
+        # LED indicators
         if circuit_needs["led_indicators"] and not any(c.get('type') == 'LED' for c in self.components):
-            self.components.append({'type': 'LED', 'pins': 2, 'name': 'Indicator LED'})
+            self.components.append({
+                'type': 'LED', 
+                'pins': 2, 
+                'name': 'Indicator LED',
+                'footprint': self.component_library['LED']['footprint'],
+                'symbol': self.component_library['LED']['symbol']
+            })
+            
             # Add current limiting resistor for LED
-            if not any(c.get('type') == 'resistor' for c in self.components):
-                self.components.append({'type': 'resistor', 'pins': 2, 'name': 'Current Limiting Resistor'})
+            if not any(c.get('name') == 'Current Limiting Resistor' for c in self.components):
+                self.components.append({
+                    'type': 'resistor', 
+                    'pins': 2, 
+                    'name': 'Current Limiting Resistor',
+                    'footprint': self.component_library['resistor']['footprint'],
+                    'symbol': self.component_library['resistor']['symbol']
+                })
         
-        if circuit_needs["sensors"] and not any(c.get('type') in ['sensor', 'analog sensor'] for c in self.components):
-            self.components.append({'type': 'sensor', 'pins': 3, 'name': 'Sensor'})
+        # Sensors
+        if circuit_needs["sensors"] and not any(c.get('type') == 'sensor' for c in self.components):
+            self.components.append({
+                'type': 'sensor', 
+                'pins': 5, 
+                'name': 'Sensor',
+                'footprint': self.component_library['sensor']['footprint'],
+                'symbol': self.component_library['sensor']['symbol']
+            })
+        
+        # Motor control
+        if circuit_needs["motor_control"] and not any('motor' in (c.get('type') or '') for c in self.components):
+            self.components.append({
+                'type': 'transistor', 
+                'pins': 3, 
+                'name': 'Motor Driver',
+                'footprint': self.component_library['transistor']['footprint'],
+                'symbol': self.component_library['transistor']['symbol']
+            })
+            
+            # Add protection diode for motor
+            self.components.append({
+                'type': 'diode', 
+                'pins': 2, 
+                'name': 'Protection Diode',
+                'footprint': self.component_library['diode']['footprint'],
+                'symbol': self.component_library['diode']['symbol']
+            })
+        
+        # Connectivity
+        if circuit_needs["connectivity"] and not any('connector' in (c.get('type') or '') for c in self.components):
+            self.components.append({
+                'type': 'connector', 
+                'pins': 5, 
+                'name': 'Interface Connector',
+                'footprint': self.component_library['connector']['footprint'],
+                'symbol': self.component_library['connector']['symbol']
+            })
         
         return {
             "circuit_needs": circuit_needs,
@@ -95,66 +334,261 @@ class PCBDesigner:
         }
     
     def set_board_parameters(self, params):
-        """Set the PCB board parameters"""
+        """
+        Set the PCB board parameters
+        
+        Args:
+            params: Dictionary of board parameters
+            
+        Returns:
+            Updated board parameters dictionary
+        """
+        default_width = 100  # mm
+        default_height = 80  # mm
+        
+        # Set default dimensions based on component count (simple heuristic)
+        if len(self.components) > 10:
+            default_width = 150
+            default_height = 100
+        elif len(self.components) > 5:
+            default_width = 120
+            default_height = 90
+        
         self.board_params = {
-            "width": params.get("width", 100),  # mm
-            "height": params.get("height", 80),  # mm
-            "layers": params.get("layers", 1),
-            "trace_width": params.get("trace_width", 0.25),  # mm
+            "width": float(params.get("width", default_width)),
+            "height": float(params.get("height", default_height)),
+            "layers": int(params.get("layers", 2)),  # Default to 2 layers for better routing
+            "trace_width": float(params.get("trace_width", 0.25)),
+            "clearance": float(params.get("clearance", 0.2)),
+            "via_diameter": float(params.get("via_diameter", 0.6)),
+            "edge_clearance": float(params.get("edge_clearance", 3.0))
         }
+        
         return self.board_params
     
     def create_schematic(self):
-        """Create a basic schematic connecting the components"""
+        """
+        Create a basic schematic connecting the components
+        
+        Returns:
+            List of connections between components
+        """
+        logger.info("Creating schematic connections")
         connections = []
         
-        # Find a microcontroller if present
-        mcu_index = -1
-        for i, comp in enumerate(self.components):
-            if comp.get("type") == "microcontroller":
-                mcu_index = i
-                break
+        # Organize components by type for easier connection
+        microcontrollers = []
+        regulators = []
+        leds = []
+        resistors = []
+        capacitors = []
+        sensors = []
+        connectors = []
+        others = []
         
-        if mcu_index >= 0:
-            # If we have a microcontroller, connect components to it
-            mcu_pins_used = 0
-            mcu_pins_available = self.components[mcu_index].get("pins", 32)
+        for i, comp in enumerate(self.components):
+            comp_type = comp.get('type', '').lower()
+            if 'microcontroller' in comp_type:
+                microcontrollers.append((i, comp))
+            elif 'regulator' in comp_type:
+                regulators.append((i, comp))
+            elif 'led' in comp_type:
+                leds.append((i, comp))
+            elif 'resistor' in comp_type:
+                resistors.append((i, comp))
+            elif 'capacitor' in comp_type:
+                capacitors.append((i, comp))
+            elif 'sensor' in comp_type:
+                sensors.append((i, comp))
+            elif 'connector' in comp_type:
+                connectors.append((i, comp))
+            else:
+                others.append((i, comp))
+        
+        # Create power connections from regulators if present
+        power_source_index = -1
+        ground_index = -1
+        
+        if regulators:
+            # Regulator is the power source
+            power_source_index = regulators[0][0]
             
-            for i, comp in enumerate(self.components):
-                if i != mcu_index:
-                    comp_type = comp.get("type")
-                    pins_needed = min(comp.get("pins", 2), mcu_pins_available - mcu_pins_used)
-                    
-                    # Connect component pins to MCU
-                    for pin in range(pins_needed):
-                        if mcu_pins_used < mcu_pins_available:
-                            connections.append({
-                                "from": {"component": mcu_index, "pin": mcu_pins_used},
-                                "to": {"component": i, "pin": pin}
-                            })
-                            mcu_pins_used += 1
+            # Connect capacitors to regulator
+            caps_connected = 0
+            for cap_idx, cap in capacitors:
+                if caps_connected == 0:
+                    # Input capacitor
+                    connections.append({
+                        "from": {"component": power_source_index, "pin": 0},
+                        "to": {"component": cap_idx, "pin": 0},
+                        "net": "VIN"
+                    })
+                    connections.append({
+                        "from": {"component": power_source_index, "pin": 1},
+                        "to": {"component": cap_idx, "pin": 1},
+                        "net": "GND"
+                    })
+                    caps_connected += 1
+                elif caps_connected == 1:
+                    # Output capacitor
+                    connections.append({
+                        "from": {"component": power_source_index, "pin": 2},
+                        "to": {"component": cap_idx, "pin": 0},
+                        "net": "VCC"
+                    })
+                    connections.append({
+                        "from": {"component": power_source_index, "pin": 1},
+                        "to": {"component": cap_idx, "pin": 1},
+                        "net": "GND"
+                    })
+                    caps_connected += 1
+                else:
+                    break
+        
+        # Find a microcontroller if present
+        if microcontrollers:
+            mcu_index = microcontrollers[0][0]
+            mcu_info = microcontrollers[0][1]
+            mcu_pins_available = mcu_info.get("pins", 32)
+            mcu_pins_used = 0
+            
+            # Connect power to MCU
+            if power_source_index >= 0:
+                connections.append({
+                    "from": {"component": power_source_index, "pin": 2},
+                    "to": {"component": mcu_index, "pin": 0},
+                    "net": "VCC"
+                })
+                connections.append({
+                    "from": {"component": power_source_index, "pin": 1},
+                    "to": {"component": mcu_index, "pin": 1},
+                    "net": "GND"
+                })
+                mcu_pins_used = 2
+            
+            # Connect decoupling capacitor to MCU
+            for cap_idx, cap in capacitors:
+                if "decoupling" in cap.get("name", "").lower():
+                    connections.append({
+                        "from": {"component": mcu_index, "pin": 0},
+                        "to": {"component": cap_idx, "pin": 0},
+                        "net": "VCC"
+                    })
+                    connections.append({
+                        "from": {"component": mcu_index, "pin": 1},
+                        "to": {"component": cap_idx, "pin": 1},
+                        "net": "GND"
+                    })
+                    break
+            
+            # Connect sensors to MCU
+            for sensor_idx, sensor in sensors:
+                # Use 3 pins for sensor: power, ground, signal
+                if mcu_pins_used + 3 <= mcu_pins_available:
+                    connections.append({
+                        "from": {"component": mcu_index, "pin": 0},
+                        "to": {"component": sensor_idx, "pin": 0},
+                        "net": "VCC"
+                    })
+                    connections.append({
+                        "from": {"component": mcu_index, "pin": 1},
+                        "to": {"component": sensor_idx, "pin": 1},
+                        "net": "GND"
+                    })
+                    connections.append({
+                        "from": {"component": mcu_index, "pin": mcu_pins_used},
+                        "to": {"component": sensor_idx, "pin": 2},
+                        "net": f"SENSOR_{sensor_idx}"
+                    })
+                    mcu_pins_used += 1
+            
+            # Connect LEDs through resistors to MCU
+            for led_idx, led in leds:
+                for res_idx, res in resistors:
+                    if "current limiting" in res.get("name", "").lower() and mcu_pins_used < mcu_pins_available:
+                        connections.append({
+                            "from": {"component": mcu_index, "pin": mcu_pins_used},
+                            "to": {"component": res_idx, "pin": 0},
+                            "net": f"LED_CONTROL_{led_idx}"
+                        })
+                        connections.append({
+                            "from": {"component": res_idx, "pin": 1},
+                            "to": {"component": led_idx, "pin": 0},
+                            "net": f"LED_ANODE_{led_idx}"
+                        })
+                        connections.append({
+                            "from": {"component": led_idx, "pin": 1},
+                            "to": {"component": mcu_index, "pin": 1},
+                            "net": "GND"
+                        })
+                        mcu_pins_used += 1
+                        break
+            
+            # Connect remaining components to MCU
+            for other_idx, other in others:
+                pins_needed = min(other.get("pins", 2), mcu_pins_available - mcu_pins_used)
+                
+                # Connect component pins to MCU
+                for pin in range(pins_needed):
+                    if mcu_pins_used < mcu_pins_available:
+                        connections.append({
+                            "from": {"component": mcu_index, "pin": mcu_pins_used},
+                            "to": {"component": other_idx, "pin": pin},
+                            "net": f"MCU_PIN_{mcu_pins_used}_TO_{other.get('name', 'COMP')}_{pin}"
+                        })
+                        mcu_pins_used += 1
+            
+            # Connect connectors to MCU
+            for conn_idx, conn in connectors:
+                pins_needed = min(conn.get("pins", 5), mcu_pins_available - mcu_pins_used)
+                
+                # First pin is usually power, second is ground
+                connections.append({
+                    "from": {"component": mcu_index, "pin": 0},
+                    "to": {"component": conn_idx, "pin": 0},
+                    "net": "VCC"
+                })
+                connections.append({
+                    "from": {"component": mcu_index, "pin": 1},
+                    "to": {"component": conn_idx, "pin": 1},
+                    "net": "GND"
+                })
+                
+                # Connect remaining pins
+                for pin in range(2, pins_needed):
+                    if mcu_pins_used < mcu_pins_available:
+                        connections.append({
+                            "from": {"component": mcu_index, "pin": mcu_pins_used},
+                            "to": {"component": conn_idx, "pin": pin},
+                            "net": f"CONN_{conn_idx}_PIN_{pin}"
+                        })
+                        mcu_pins_used += 1
         else:
             # Simple daisy chain for linear circuits
             for i in range(len(self.components) - 1):
                 connections.append({
                     "from": {"component": i, "pin": 1},
-                    "to": {"component": i + 1, "pin": 0}
+                    "to": {"component": i + 1, "pin": 0},
+                    "net": f"NET_{i}_TO_{i+1}"
                 })
-                
-                # Add power connections if components need it
-                if i > 0 and self.components[i].get("pins", 2) > 2:
-                    # Assume pin 2 is power
-                    connections.append({
-                        "from": {"component": 0, "pin": 0},
-                        "to": {"component": i, "pin": 2}
-                    })
         
         return connections
     
     def generate_pcb_design(self, output_dir=None):
-        """Generate PCB design files and preview"""
+        """
+        Generate PCB design files and preview
+        
+        Args:
+            output_dir: Optional output directory path
+            
+        Returns:
+            Dictionary with paths to generated files
+        """
+        logger.info("Generating PCB design")
+        
         if not output_dir:
             output_dir = tempfile.mkdtemp()
+            logger.info(f"Created temporary directory for output: {output_dir}")
         
         # Create connections between components
         connections = self.create_schematic()
@@ -163,31 +597,324 @@ class PCBDesigner:
         gerber_dir = os.path.join(output_dir, "gerber")
         os.makedirs(gerber_dir, exist_ok=True)
         
-        gerber_generator = GerberGenerator(self.components, connections, self.board_params)
-        gerber_files = gerber_generator.generate_all_files(gerber_dir)
+        # For MVP, we'll use mock Gerber generation
+        generated_files = self._generate_mock_gerber_files(gerber_dir)
         
-        # Generate visualization
+        # For MVP, we'll use mock visualization
         preview_dir = os.path.join(output_dir, "preview")
         os.makedirs(preview_dir, exist_ok=True)
         
-        visualizer = PCBVisualizer(self.components, connections, self.board_params, gerber_generator.placements)
         preview_2d_path = os.path.join(preview_dir, "pcb_2d_preview.png")
         preview_3d_path = os.path.join(preview_dir, "pcb_3d_preview.png")
         
-        visualizer.render_pcb(preview_2d_path)
-        visualizer.generate_3d_preview(preview_3d_path)
+        self._generate_mock_previews(preview_2d_path, preview_3d_path)
         
         return {
             "gerber_dir": gerber_dir,
-            "gerber_files": gerber_files,
+            "gerber_files": generated_files,
             "preview_2d": preview_2d_path,
             "preview_3d": preview_3d_path,
             "components": self.components,
             "connections": connections
         }
     
+    def _generate_mock_gerber_files(self, output_dir):
+        """
+        Generate mock Gerber files for MVP
+        In a real app, this would use a proper Gerber generator
+        
+        Args:
+            output_dir: Directory to save the generated files
+            
+        Returns:
+            List of generated file paths
+        """
+        # Determine the files to generate based on layers
+        layer_files = [
+            "F_Cu.gbr",        # Top copper
+            "F_Mask.gbr",      # Top solder mask
+            "F_SilkS.gbr",     # Top silkscreen
+            "Edge_Cuts.gbr",   # Board outline
+            "F_Paste.gbr",     # Top paste
+            "board.drl"        # Drill file
+        ]
+        
+        if self.board_params.get("layers", 1) > 1:
+            layer_files.extend([
+                "B_Cu.gbr",    # Bottom copper
+                "B_Mask.gbr",  # Bottom solder mask
+                "B_SilkS.gbr", # Bottom silkscreen
+                "B_Paste.gbr"  # Bottom paste
+            ])
+        
+        # Generate mock content for each file
+        generated_files = []
+        for filename in layer_files:
+            file_path = os.path.join(output_dir, filename)
+            with open(file_path, 'w') as f:
+                # Create basic mock Gerber content based on file type
+                if "Cu" in filename:
+                    f.write(self._generate_mock_copper_layer(filename))
+                elif "Edge_Cuts" in filename:
+                    f.write(self._generate_mock_outline())
+                elif "drl" in filename:
+                    f.write(self._generate_mock_drill_file())
+                else:
+                    f.write(self._generate_mock_other_layer(filename))
+            
+            generated_files.append(file_path)
+        
+        return generated_files
+    
+    def _generate_mock_copper_layer(self, filename):
+        """Generate mock content for copper layer"""
+        layer_name = "Top" if "F_" in filename else "Bottom"
+        return f"""G04 {layer_name} copper layer*
+G04 Generated by Circuit IQ*
+%FSLAX46Y46*%
+%MOMM*%
+G01*
+G75*
+G04 Define apertures*
+%ADD10C,0.150000*%
+%ADD11R,1.500000X1.500000*%
+G04 Start drawing*
+D10*
+X{int(self.board_params.get("width", 100) * 1000)}Y{int(self.board_params.get("height", 80) * 1000)}D02*
+X0Y0D01*
+M02*"""
+    
+    def _generate_mock_outline(self):
+        """Generate mock content for board outline"""
+        width = int(self.board_params.get("width", 100) * 1000)
+        height = int(self.board_params.get("height", 80) * 1000)
+        
+        return f"""G04 Board outline*
+G04 Generated by Circuit IQ*
+%FSLAX46Y46*%
+%MOMM*%
+G01*
+G75*
+G04 Define apertures*
+%ADD10C,0.100000*%
+G04 Start drawing*
+D10*
+X0Y0D02*
+X{width}Y0D01*
+X{width}Y{height}D01*
+X0Y{height}D01*
+X0Y0D01*
+M02*"""
+    
+    def _generate_mock_drill_file(self):
+        """Generate mock content for drill file"""
+        return f"""M48
+;DRILL file {len(self.components)} holes
+;Generated by Circuit IQ
+METRIC,TZ
+T1C0.4
+T2C1.0
+%
+T1
+X{int(self.board_params.get("width", 100) * 0.25)}Y{int(self.board_params.get("height", 80) * 0.25)}
+X{int(self.board_params.get("width", 100) * 0.75)}Y{int(self.board_params.get("height", 80) * 0.75)}
+T2
+X{int(self.board_params.get("width", 100) * 0.5)}Y{int(self.board_params.get("height", 80) * 0.5)}
+M30"""
+    
+    def _generate_mock_other_layer(self, filename):
+        """Generate mock content for other layers"""
+        layer_type = filename.split('_')[1].split('.')[0]
+        return f"""G04 {layer_type} layer*
+G04 Generated by Circuit IQ*
+%FSLAX46Y46*%
+%MOMM*%
+G01*
+G75*
+G04 Start drawing*
+M02*"""
+    
+    def _generate_mock_previews(self, preview_2d_path, preview_3d_path):
+        """
+        Generate mock preview images for MVP
+        In a real app, this would render actual PCB visualizations
+        
+        Args:
+            preview_2d_path: Path to save 2D preview image
+            preview_3d_path: Path to save 3D preview image
+        """
+        try:
+            # In a real app, we would generate actual previews
+            # For MVP, we'll create simple colored rectangles as placeholders
+            from PIL import Image, ImageDraw, ImageFont
+            
+            # Create 2D preview image (top view)
+            width = int(self.board_params.get("width", 100) * 5)  # Scale for better visibility
+            height = int(self.board_params.get("height", 80) * 5)
+            
+            # Create 2D preview
+            img_2d = Image.new('RGB', (width, height), color=(0, 130, 0))  # Green PCB
+            draw_2d = ImageDraw.Draw(img_2d)
+            
+            # Draw component outlines
+            for i, component in enumerate(self.components):
+                # Place components in a grid pattern
+                cols = max(1, min(4, len(self.components) // 3 + 1))
+                row = i // cols
+                col = i % cols
+                
+                x1 = col * width // cols + width // (cols * 4)
+                y1 = row * height // (len(self.components) // cols + 1) + height // 20
+                x2 = x1 + width // (cols * 2)
+                y2 = y1 + height // 15
+                
+                # Draw rectangle for component
+                draw_2d.rectangle([x1, y1, x2, y2], fill=(200, 200, 200), outline=(0, 0, 0))
+                
+                # Add component name if possible
+                try:
+                    font = ImageFont.truetype("arial.ttf", 12)
+                except IOError:
+                    font = ImageFont.load_default()
+                
+                comp_name = component.get('name', f'Component {i+1}')
+                if len(comp_name) > 15:
+                    comp_name = comp_name[:12] + '...'
+                
+                draw_2d.text((x1 + 5, y1 + 5), comp_name, fill=(0, 0, 0), font=font)
+            
+            # Draw some traces between components
+            for i in range(min(10, len(self.components) - 1)):
+                start_i = i
+                end_i = i + 1
+                
+                # Calculate start and end positions
+                start_col = start_i % cols
+                start_row = start_i // cols
+                end_col = end_i % cols
+                end_row = end_i // cols
+                
+                start_x = start_col * width // cols + width // (cols * 2)
+                start_y = start_row * height // (len(self.components) // cols + 1) + height // 15
+                end_x = end_col * width // cols + width // (cols * 2)
+                end_y = end_row * height // (len(self.components) // cols + 1) + height // 15
+                
+                # Draw line for trace
+                draw_2d.line([start_x, start_y, end_x, end_y], fill=(255, 215, 0), width=2)  # Gold color for traces
+            
+            # Add text with board dimensions
+            board_info = f"Board: {self.board_params.get('width')}mm x {self.board_params.get('height')}mm, {self.board_params.get('layers')} layers"
+            draw_2d.text((10, height - 20), board_info, fill=(255, 255, 255))
+            
+            # Save 2D preview
+            img_2d.save(preview_2d_path)
+            
+            # Create 3D preview (isometric view)
+            img_3d = Image.new('RGB', (width, height), color=(50, 50, 70))  # Darker background
+            draw_3d = ImageDraw.Draw(img_3d)
+            
+            # Draw board outline with perspective
+            board_width = int(width * 0.8)
+            board_height = int(height * 0.6)
+            board_x = (width - board_width) // 2
+            board_y = (height - board_height) // 2
+            
+            # Top face (rectangle)
+            board_color = (0, 100, 0)  # Darker green for 3D effect
+            draw_3d.polygon([
+                (board_x, board_y),
+                (board_x + board_width, board_y),
+                (board_x + board_width, board_y + board_height),
+                (board_x, board_y + board_height)
+            ], fill=board_color, outline=(0, 0, 0))
+            
+            # Side face (to create 3D effect)
+            side_offset = int(width * 0.05)  # Perspective offset
+            draw_3d.polygon([
+                (board_x + board_width, board_y),
+                (board_x + board_width + side_offset, board_y - side_offset),
+                (board_x + board_width + side_offset, board_y + board_height - side_offset),
+                (board_x + board_width, board_y + board_height)
+            ], fill=(0, 80, 0), outline=(0, 0, 0))
+            
+            # Top edge (to create 3D effect)
+            draw_3d.polygon([
+                (board_x, board_y),
+                (board_x + side_offset, board_y - side_offset),
+                (board_x + board_width + side_offset, board_y - side_offset),
+                (board_x + board_width, board_y)
+            ], fill=(0, 120, 0), outline=(0, 0, 0))
+            
+            # Draw 3D components
+            for i, component in enumerate(self.components):
+                # Place components in a grid pattern on the board
+                cols = max(1, min(4, len(self.components) // 3 + 1))
+                row = i // cols
+                col = i % cols
+                
+                # Scale positions to fit on the board
+                rel_x = col / cols
+                rel_y = row / (len(self.components) // cols + 1)
+                
+                # Calculate component position on the board
+                x = int(board_x + rel_x * board_width)
+                y = int(board_y + rel_y * board_height)
+                width_c = int(board_width * 0.15)
+                height_c = int(board_height * 0.1)
+                
+                # Determine component color based on type
+                comp_type = component.get('type', '').lower()
+                if 'microcontroller' in comp_type:
+                    color = (50, 50, 200)  # Blue for MCUs
+                elif 'capacitor' in comp_type:
+                    color = (200, 50, 50)  # Red for capacitors
+                elif 'resistor' in comp_type:
+                    color = (150, 75, 0)  # Brown for resistors
+                elif 'led' in comp_type:
+                    color = (255, 255, 0)  # Yellow for LEDs
+                else:
+                    color = (150, 150, 150)  # Gray for other components
+                
+                # Draw component with 3D effect
+                draw_3d.rectangle([x, y, x + width_c, y + height_c], fill=color, outline=(0, 0, 0))
+                draw_3d.polygon([
+                    (x + width_c, y),
+                    (x + width_c + side_offset//2, y - side_offset//2),
+                    (x + width_c + side_offset//2, y + height_c - side_offset//2),
+                    (x + width_c, y + height_c)
+                ], fill=tuple(max(0, c - 30) for c in color), outline=(0, 0, 0))
+                draw_3d.polygon([
+                    (x, y),
+                    (x + side_offset//2, y - side_offset//2),
+                    (x + width_c + side_offset//2, y - side_offset//2),
+                    (x + width_c, y)
+                ], fill=tuple(min(255, c + 30) for c in color), outline=(0, 0, 0))
+            
+            # Add text with 3D view info
+            draw_3d.text((10, height - 20), "3D Preview - Isometric View", fill=(255, 255, 255))
+            
+            # Save 3D preview
+            img_3d.save(preview_3d_path)
+            
+        except Exception as e:
+            logger.error(f"Error generating preview images: {e}")
+            # Create blank images as fallback
+            img = Image.new('RGB', (400, 300), color=(200, 200, 200))
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 10), "Preview generation failed", fill=(0, 0, 0))
+            img.save(preview_2d_path)
+            img.save(preview_3d_path)
+    
     def create_zip_archive(self, gerber_dir):
-        """Create a ZIP archive of all Gerber files"""
+        """
+        Create a ZIP archive of all Gerber files
+        
+        Args:
+            gerber_dir: Directory containing Gerber files
+            
+        Returns:
+            BytesIO object containing the ZIP archive
+        """
         memory_file = BytesIO()
         
         with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -204,12 +931,39 @@ class PCBDesigner:
 # API Routes
 @app.route('/')
 def index():
+    """Serve the main page"""
     return render_template('index.html')
 
 @app.route('/api/design_pcb', methods=['POST'])
 def design_pcb():
+    """
+    API endpoint to design a PCB based on requirements and datasheets
+    
+    Expects a JSON payload with:
+    - requirements: Text description of circuit requirements
+    - datasheets: List of datasheet objects (with name and content)
+    - board_params: Board parameters (width, height, layers, etc.)
+    
+    Returns:
+    - JSON with PCB design data including previews and Gerber files
+    """
     try:
         data = request.json
+        logger.info("Received PCB design request")
+        
+        if not data:
+            return jsonify({
+                'status': 'error',
+                'message': 'No data provided'
+            })
+        
+        # Log request data (excluding large datasheet content)
+        log_data = data.copy()
+        if 'datasheets' in log_data:
+            for ds in log_data['datasheets']:
+                if 'content' in ds:
+                    ds['content'] = f"[{len(ds['content'])} chars]"
+        logger.info(f"Request data: {log_data}")
         
         # Initialize PCB designer
         designer = PCBDesigner()
@@ -226,7 +980,14 @@ def design_pcb():
         designer.set_board_parameters(data.get('board_params', {}))
         
         # Generate PCB design
-        design_result = designer.generate_pcb_design()
+        try:
+            design_result = designer.generate_pcb_design()
+        except Exception as e:
+            logger.error(f"Error generating PCB design: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': f"Error generating PCB design: {str(e)}"
+            })
         
         # Return results with base64 encoded previews
         with open(design_result['preview_2d'], 'rb') as f:
@@ -244,15 +1005,23 @@ def design_pcb():
                     'url': f'/api/download/gerber/{os.path.basename(design_result["gerber_dir"])}/{file}'
                 })
         
-        return jsonify({
+        # Prepare response
+        response = {
             'status': 'success',
             'preview_2d': f'data:image/png;base64,{preview_2d_base64}',
             'preview_3d': f'data:image/png;base64,{preview_3d_base64}',
             'gerber_files': gerber_files,
             'download_all_url': f'/api/download/all/{os.path.basename(design_result["gerber_dir"])}',
-            'components': analysis['components']
-        })
+            'components': analysis['components'],
+            'board_params': designer.board_params
+        }
+        
+        # Add suggestions based on analysis
+        response['suggestions'] = generate_design_suggestions(analysis, designer.board_params)
+        
+        return jsonify(response)
     except Exception as e:
+        logger.error(f"Error processing PCB design request: {e}")
         return jsonify({
             'status': 'error',
             'message': str(e)
@@ -260,6 +1029,12 @@ def design_pcb():
 
 @app.route('/api/upload_datasheet', methods=['POST'])
 def upload_datasheet():
+    """
+    API endpoint to upload and process a datasheet PDF
+    
+    Returns:
+    - JSON with extracted parameters from the datasheet
+    """
     if 'file' not in request.files:
         return jsonify({'status': 'error', 'message': 'No file part'})
     
@@ -268,23 +1043,42 @@ def upload_datasheet():
         return jsonify({'status': 'error', 'message': 'No selected file'})
     
     if file:
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
-        
-        # Extract data from datasheet
-        extractor = DatasheetExtractor()
-        result = extractor.process_datasheet(file_path)
-        
-        return jsonify({
-            'status': 'success',
-            'filename': filename,
-            'parameters': result['parameters'],
-            'raw_text_sample': result['raw_text_sample']
-        })
+        try:
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+            
+            logger.info(f"Datasheet file uploaded: {filename}")
+            
+            # Extract data from datasheet
+            extractor = DatasheetExtractor()
+            result = extractor.process_datasheet(file_path)
+            
+            if not result['success']:
+                return jsonify({
+                    'status': 'warning',
+                    'filename': filename,
+                    'message': 'File uploaded but could not extract complete information',
+                    'partial_data': result.get('parameters', {})
+                })
+            
+            return jsonify({
+                'status': 'success',
+                'filename': filename,
+                'parameters': result['parameters'],
+                'connections': result.get('connections', {'all_pins': []}),
+                'raw_text_sample': result.get('raw_text_sample', '')
+            })
+        except Exception as e:
+            logger.error(f"Error processing datasheet upload: {e}")
+            return jsonify({
+                'status': 'error',
+                'message': f"Error processing datasheet: {str(e)}"
+            })
 
 @app.route('/api/download/gerber/<dir_name>/<filename>')
 def download_gerber_file(dir_name, filename):
+    """Download a specific Gerber file"""
     temp_dir = tempfile.gettempdir()
     gerber_dir = os.path.join(temp_dir, dir_name, "gerber")
     file_path = os.path.join(gerber_dir, filename)
@@ -296,6 +1090,7 @@ def download_gerber_file(dir_name, filename):
 
 @app.route('/api/download/all/<dir_name>')
 def download_all_gerbers(dir_name):
+    """Download all Gerber files as a ZIP archive"""
     temp_dir = tempfile.gettempdir()
     gerber_dir = os.path.join(temp_dir, dir_name, "gerber")
     
@@ -307,17 +1102,64 @@ def download_all_gerbers(dir_name):
             zip_file,
             mimetype='application/zip',
             as_attachment=True,
-            download_name='pcb_gerber_files.zip'
+            download_name='circuit_iq_gerber_files.zip'
         )
     else:
         return jsonify({'status': 'error', 'message': 'Gerber directory not found'})
 
 
-# Templates directory structure
-@app.route('/templates/index.html')
-def serve_template():
-    return render_template('index.html')
+def generate_design_suggestions(analysis, board_params):
+    """
+    Generate design suggestions based on analysis
+    
+    Args:
+        analysis: Analysis results from PCBDesigner
+        board_params: Board parameters
+        
+    Returns:
+        List of suggestion strings
+    """
+    suggestions = []
+    
+    # Component-based suggestions
+    components = analysis.get('components', [])
+    component_types = [c.get('type', '').lower() for c in components]
+    
+    # Check for microcontroller-related suggestions
+    if any('microcontroller' in t for t in component_types):
+        suggestions.append("Add decoupling capacitors (0.1μF) near the microcontroller power pins.")
+        suggestions.append("Include a reset circuit with pull-up resistor for the microcontroller.")
+        
+        # Check if crystal/oscillator might be needed
+        if not any(('crystal' in t or 'oscillator' in t) for t in component_types):
+            suggestions.append("Consider adding an external crystal oscillator for more precise timing.")
+    
+    # Check for power-related suggestions
+    if any('regulator' in t for t in component_types):
+        suggestions.append("Add input and output capacitors for voltage regulators to improve stability.")
+        
+        # Check for protection components
+        if not any(('protection' in t or 'diode' in t) for t in component_types):
+            suggestions.append("Include reverse polarity protection diode on power input.")
+    
+    # Check for LED-related suggestions
+    if any('led' in t for t in component_types) and not any('resistor' in t for t in component_types):
+        suggestions.append("Add current-limiting resistors for LEDs to prevent damage.")
+    
+    # Board parameter suggestions
+    if board_params.get('layers', 1) == 1 and len(components) > 5:
+        suggestions.append("Consider using a 2-layer board for easier routing with this many components.")
+    
+    if board_params.get('trace_width', 0.25) < 0.2:
+        suggestions.append("Increase trace width to at least 0.2mm for better manufacturability.")
+    
+    # Add manufacturing suggestions
+    suggestions.append("Add fiducial markers if using automated assembly.")
+    suggestions.append("Include a ground plane for better signal integrity and EMI reduction.")
+    
+    return suggestions
 
 
 if __name__ == '__main__':
+    logger.info("Starting Circuit IQ PCB Designer backend")
     app.run(debug=True, host='0.0.0.0', port=5000)
